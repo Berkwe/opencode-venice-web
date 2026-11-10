@@ -18,6 +18,10 @@
  */
 import { spawn, execFileSync } from 'node:child_process'
 
+import { writeFileSync, unlinkSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { randomUUID } from "node:crypto"
+
 let curlPath
 
 /** The curl binary (VENICE_WEB_CURL overrides), or null when none is installed. */
@@ -90,6 +94,9 @@ export function curlFetch(url, { method = 'GET', headers, body, signal } = {}) {
   // through `-A`, where curl puts it in its usual place.
   const userAgent = new Headers(headers).get('user-agent')
   const args = ['-sS', '--http1.1', '--no-buffer', '--proto', '=https', '-D', '-', '-X', method, '-H', '@/dev/fd/3']
+  const headerFile = `${tmpdir()}/venice-h-${randomUUID()}`
+  writeFileSync(headerFile, headerLines(headers), { mode: 0o600 })
+  args[args.indexOf("@/dev/fd/3")] = `@${headerFile}`
   if (userAgent) args.push('-A', userAgent)
   if (body != null) args.push('--data-binary', '@-')
   args.push(url)
@@ -168,6 +175,7 @@ export function curlFetch(url, { method = 'GET', headers, body, signal } = {}) {
     })
 
     child.on('close', (code) => {
+      try { unlinkSync(headerFile) } catch {}
       signal?.removeEventListener('abort', onAbort)
       if (code === 0 || code === null) {
         if (!settled) return fail(new Error('curl: no response'))
