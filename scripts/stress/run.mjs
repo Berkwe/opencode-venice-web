@@ -21,7 +21,7 @@ const option = (name, fallback) => {
   const index = args.indexOf(`--${name}`)
   return index >= 0 ? args[index + 1] : fallback
 }
-const model = option('model', 'venice-web/deepseek-v4-1-flash-free')
+const model = option('model', 'venice-web/deepseek-v4-1-flash-uncensored')
 const baseURL = option('base-url')
 const only = option('only')?.split(',')
 const parallel = Number(option('parallel', '2'))

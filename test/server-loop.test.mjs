@@ -46,14 +46,46 @@ test('collectStream stops a Venice tool loop past three steps', async () => {
   const { body, wasCancelled } = sse(events, { close: false })
   const state = await drain(collectStream(body, mapping, chunk, { stopServerLoop: true }))
   assert.equal(state.serverLoop, true)
-  assert.equal(state.steps.size, 4)
+  // cut on the second stuck step: native call detected, no text yet
+  assert.equal(state.steps.size, 2)
   assert.deepEqual([...state.nativeTools], ['bash'])
   assert.equal(state.text, '')
   assert.equal(wasCancelled(), true)
 })
 
+test('collectStream cuts a native call early, before Venice can loop on it', async () => {
+  const events = [...step(0), ...step(1), ...step(2), ...message(3, 'gave up')]
+  const state = await drain(collectStream(sse(events).body, mapping, chunk, { stopServerLoop: true }))
+  assert.equal(state.serverLoop, true)
+  assert.equal(state.steps.size, 2)
+  assert.equal(state.text, '')
+})
+
+test('collectStream keeps a reply that arrived before the native call', async () => {
+  const events = [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'message' } },
+    { type: 'response.output_text.delta', output_index: 0, delta: '{"content":"x"' },
+    ...step(1),
+    ...step(2),
+    ...step(3),
+    ...message(4, 'gave up'),
+  ]
+  const state = await drain(collectStream(sse(events).body, mapping, chunk, { stopServerLoop: true }))
+  // text is already there, so the early cut does not fire and only the 3-step
+  // ceiling applies - which the recovery reply then completes
+  assert.equal(state.serverLoop, false)
+  assert.equal(state.steps.size, 3)
+  assert.equal(state.text, '{"content":"x"gave up')
+})
+
 test('collectStream lets a short recovery through', async () => {
-  const events = [...step(0), ...step(1), ...message(2, '{"content":"","status":"continue","tool_calls":[]}')]
+  const events = [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'message' } },
+    { type: 'response.output_text.delta', output_index: 0, delta: '{"content":""' },
+    ...step(1),
+    ...step(2),
+    ...message(3, '","status":"continue","tool_calls":[]}'),
+  ]
   const state = await drain(collectStream(sse(events).body, mapping, chunk, { stopServerLoop: true }))
   assert.equal(state.serverLoop, false)
   assert.equal(state.terminal, true)

@@ -29,6 +29,7 @@ import { repairJsonControlChars } from './sanitize.mjs'
  * language.
  */
 export const TOOL_PROMPT = `You are connected to an external agent that executes tools on the user's computer. These tools ARE called directly by name in \`tool_calls\` (not inside \`execute\`); they are NOT Venice server tools.
+Do not use built-in function calling: never emit a native tool call, only the "tool_calls" array of your JSON reply.
 Return ONLY one valid JSON object, without markdown fences and without any text outside JSON, with this exact shape:
 {"content":"text for the user, or an empty string","status":"continue","tool_calls":[{"name":"exact tool name","arguments":{}}]}
 "status" is required and is one of:
@@ -80,7 +81,7 @@ export const RESULT_REMINDER =
  * the way they were called was wrong.
  */
 export const NATIVE_CALL_REMINDER =
-  'your tools work. Do not use built-in function calling or any native tool-call syntax: the ONLY way to call a tool is the "tool_calls" array of your JSON reply. Ignore any earlier "Tool not found" message and call the tool you need now in tool_calls with "status":"continue".'
+  'your tools work. You used built-in function calling, which Venice ran itself (hence "Tool not found"). The ONLY way to call a tool is the "tool_calls" array of your JSON reply: ignore that message and send the same tool call now as {"content":"","status":"continue","tool_calls":[{"name":"...","arguments":{...}}]}.'
 
 /** A reply cut off because Venice was looping on native tool calls. */
 export function serverLoopMessage() {
@@ -323,6 +324,14 @@ export function textOf(content) {
     .join('\n')
 }
 
+/** True when a message carries an image part (OpenAI `image_url`). */
+export function hasImages(message) {
+  return Array.isArray(message?.content) && message.content.some((part) => part?.type === 'image_url')
+}
+
+/** A message whose content is only an image (no text) still needs a prompt. */
+export const IMAGE_ONLY_PROMPT = 'Look at the attached image.'
+
 /** OpenAI reasoning_effort -> the web endpoint's three-valued switch. */
 export function reasoningMode(body) {
   const effort = body?.reasoning_effort ?? body?.reasoningEffort ?? body?.reasoning?.effort
@@ -345,6 +354,9 @@ function safeJson(value) {
  * @returns {{ request: object, toolNames: Set<string>, toolSchemas: Map<string, object>, emulatedTools: boolean }}
  */
 export function toVeniceRequest(body) {
+  if (MODELS[body.model]?.kind === 'image') {
+    throw new Error(`${body.model} is an image model, use /v1/images/generations`)
+  }
   if (!MODELS[body.model]) {
     throw new Error(`unknown model: ${body.model}. Known: ${Object.keys(MODELS).join(', ')}`)
   }
@@ -371,8 +383,12 @@ export function toVeniceRequest(body) {
     }
     if (!['user', 'assistant', 'tool'].includes(message.role)) continue
 
+    // Image parts are uploaded separately (`media.mjs`) and re-attached as
+    // `input_image` parts on the last user turn only; older turns keep the
+    // `[image]` marker so the bytes are not sent on every request.
+    const images = message.role === 'user' && hasImages(message)
     let role = message.role
-    let content = text
+    let content = images && !text ? IMAGE_ONLY_PROMPT : text
 
     if (message.role === 'tool') {
       // Tool results travel as a user message in the agent's own envelope shape.
@@ -397,12 +413,17 @@ export function toVeniceRequest(body) {
       })
     }
 
+    const parts = [{ type: 'output_text', text: content, annotations: [] }]
+    // the OpenAI parts travel along: `media.mjs` uploads them and swaps them for
+    // `input_image` parts on the request this message belongs to
+    if (images) parts.push(...message.content.filter((part) => part?.type === 'image_url'))
     messages.push({
       id: randomUUID(),
       type: 'message',
       status: 'completed',
       role,
-      content: [{ type: 'output_text', text: content, annotations: [] }],
+      content: parts,
+      ...(images ? { needsImages: true } : {}),
     })
   }
 
@@ -448,6 +469,19 @@ export function toVeniceRequest(body) {
     toolSchemas: new Map(tools.map((tool) => [tool.function.name, tool.function.parameters ?? {}])),
     emulatedTools: tools.length > 0,
   }
+}
+
+/**
+ * Returns the translated messages of the turn that still has to get its image
+ * parts, so they can be uploaded (`media.mjs`). Those are the same objects the
+ * request carries: `attachImages` rewrites their content in place, which is how
+ * the `input_image` parts reach the request. The `needsImages` marker is dropped
+ * on the way, it only tells this path that the turn has images at all.
+ */
+export function imageMessages(request) {
+  const marked = request.messages.filter((message) => message.needsImages)
+  for (const message of marked) delete message.needsImages
+  return marked
 }
 
 /**

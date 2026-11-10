@@ -2,8 +2,28 @@
 
 ## Unreleased
 
+- **Image input works.** An OpenAI `image_url` part (data: URL, http URL or a
+  local path) is uploaded first, then sent twice: once to receive the backend's
+  hydration step, once as multipart with the bytes attached. Vision models now
+  describe the picture instead of guessing from the text. Old turns keep a text
+  marker so the bytes are not resent every turn. See docs/PROTOCOL.md §5.1;
+  measured 8/8 on two coloured fixtures.
+- **The default model is a catalogue id again.** `DEFAULT_MODEL` still pointed at
+  `deepseek-v4-1-flash-free`, which the 2026-11-10 catalogue refresh removed; the
+  first request of a fresh install would have failed with `unknown model`. It is
+  now `deepseek-v4-1-flash-uncensored`, guarded at import and covered by tests.
+- **Venice's tool loop is cut earlier.** The step counter alone let a stuck turn
+  run to Venice's 10-step cap and give up without an answer; the response is now
+  cut as soon as a native call appears (2nd step), the last retry is watched too,
+  and the reminder says why "Tool not found" showed up.
+- **Text-to-image models are in the pool.** The five free ones from the web
+  catalogue (`z-image-turbo`, `venice-sd35`, `lustify-v8`, `wai-Illustrious`,
+  `chroma`) serve `POST /v1/images/generations` (`{model, prompt, n, size}` to
+  `{data:[{b64_json}]}`). Three of them are NSFW-capable, `wai-Illustrious` is
+  hentai-tuned. `/v1/models` marks them `kind: "image"` and a chat call to one
+  fails with a pointer to the image route. The other 40 image models cost credits.
+  Protocol: docs/PROTOCOL.md §5.2.
 - `skills/opencode-orchestrator/`: a Claude Code skill that lets Claude plan work,
-  hand small tasks to `opencode run` workers and verify every result itself. The
   scripts close stdin (an open pipe made workers hang before the model was called),
   put a hard time limit on every run, check that the installed `opencode` accepts
   every flag used (an unknown flag exits 0 without running), and nudge the same

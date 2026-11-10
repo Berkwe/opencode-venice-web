@@ -37,7 +37,7 @@ import {
   toVeniceRequest,
   withRetryReminder,
 } from '../src/lib/emulate.mjs'
-import { MODELS } from '../src/lib/models.mjs'
+import { DEFAULT_MODEL, MODELS } from '../src/lib/models.mjs'
 import * as real from './fixtures/real-replies.mjs'
 
 const tool = (name) => ({ type: 'function', function: { name, description: name, parameters: { type: 'object' } } })
@@ -515,7 +515,7 @@ test('preferAnswer: executable calls beat calls with problems', () => {
 
 test('toVeniceRequest keeps each tool schema for validation', () => {
   const mapping = toVeniceRequest({
-    model: 'deepseek-v4-1-flash-free',
+    model: DEFAULT_MODEL,
     messages: [{ role: 'user', content: 'hi' }],
     tools: [{ type: 'function', function: { name: 'read', parameters: { type: 'object', required: ['path'] } } }],
   })
@@ -567,7 +567,7 @@ test('the tool prompt defines status and the multi-line script rule', () => {
 
 test('buildJudgeRequest carries the request, the newest tool outputs and the reply', () => {
   const body = {
-    model: 'deepseek-v4-1-flash-free',
+    model: DEFAULT_MODEL,
     messages: [
       { role: 'system', content: 'sys' },
       { role: 'user', content: 'old request' },

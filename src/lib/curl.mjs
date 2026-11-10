@@ -83,6 +83,97 @@ export function parseHead(buffer) {
   }
 }
 
+/**
+ * `fetch()` lookalike backed by curl for a multipart/form-data POST; resolves to
+ * a Response with a streaming body. Text fields go in first, then the files; both
+ * are written to temp files because a form field can be arbitrarily long and curl
+ * cannot mix `-F` with stdin.
+ * @param {{ field: string, filename: string, contentType: string, data: Buffer }[]} files
+ */
+export function curlMultipartFetch(url, { method = 'POST', headers, fields = {}, files = [], signal } = {}) {
+  const bin = findCurl()
+  if (!bin) return Promise.reject(new Error('curl is not installed (needed for the Venice inference route)'))
+  if (!url.startsWith('https://')) return Promise.reject(new Error('curl transport only speaks https'))
+
+  const userAgent = new Headers(headers).get('user-agent')
+  const headerFile = `${tmpdir()}/venice-h-${randomUUID()}`
+  writeFileSync(headerFile, headerLines(headers), { mode: 0o600 })
+  const args = ['-sS', '--http1.1', '--no-buffer', '--proto', '=https', '-D', '-', '-X', method, '-H', `@${headerFile}`]
+  if (userAgent) args.push('-A', userAgent)
+  const tempFiles = []
+  // curl keeps `Expect: 100-continue` for large multipart bodies too
+  args.push('-H', 'Expect:')
+  for (const [name, value] of Object.entries(fields)) {
+    const temp = `${tmpdir()}/venice-v-${randomUUID()}`
+    writeFileSync(temp, value, { mode: 0o600 })
+    tempFiles.push(temp)
+    args.push('-F', `${name}=<${temp}`)
+  }
+  for (const file of files) {
+    const temp = `${tmpdir()}/venice-f-${randomUUID()}`
+    writeFileSync(temp, file.data, { mode: 0o600 })
+    tempFiles.push(temp)
+    args.push('-F', `${file.field}=@${temp};type=${file.contentType};filename=${file.filename}`)
+  }
+  args.push(url)
+
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason ?? new Error('aborted'))
+    const child = spawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe', 'pipe'] })
+    child.stdin.end()
+    let head = Buffer.alloc(0)
+    let controller = null
+    let settled = false
+    let done = false
+    let stderr = ''
+    const cleanup = () => {
+      try { unlinkSync(headerFile) } catch {}
+      for (const temp of tempFiles) { try { unlinkSync(temp) } catch {} }
+    }
+    const push = (data) => {
+      if (done || !controller) return
+      try { controller.enqueue(new Uint8Array(data)) } catch { done = true }
+    }
+    const fail = (error) => {
+      if (!settled) { settled = true; reject(error) } else if (!done) {
+        done = true
+        try { controller?.error(error) } catch {}
+      }
+    }
+    const onAbort = () => { child.kill(); fail(signal.reason ?? new Error('aborted')) }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    child.stderr.on('data', (data) => { stderr += data })
+    child.on('error', fail)
+    child.stdout.on('data', (data) => {
+      if (settled) return push(data)
+      head = Buffer.concat([head, data])
+      let parsed
+      try { parsed = parseHead(head) } catch (error) { child.kill(); return fail(error) }
+      if (!parsed) return
+      settled = true
+      const nullBody = [101, 204, 205, 304].includes(parsed.status)
+      const readable = new ReadableStream({
+        start(c) {
+          controller = c
+          if (parsed.rest.length) c.enqueue(new Uint8Array(parsed.rest))
+        },
+        cancel() { done = true; child.kill() },
+      })
+      resolve(new Response(nullBody ? null : readable, { status: parsed.status, headers: parsed.headers }))
+    })
+    child.on('close', (code) => {
+      cleanup()
+      signal?.removeEventListener('abort', onAbort)
+      if (code === 0 || code === null) {
+        if (!settled) return fail(new Error('curl: no response'))
+        if (done) return
+        done = true
+        try { controller?.close() } catch {}
+      } else fail(new Error(`curl exited with code ${code}${stderr ? `: ${stderr.trim()}` : ''}`))
+    })
+  })
+}
+
 /** `fetch()` lookalike backed by curl; resolves to a Response with a streaming body. */
 export function curlFetch(url, { method = 'GET', headers, body, signal } = {}) {
   const bin = findCurl()

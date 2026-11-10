@@ -23,6 +23,8 @@ import {
 import { curlFetch, findCurl, isCloudflareBlock } from './curl.mjs'
 
 const INFERENCE_PATH = '/api/inference/chat/agents/ad-hoc'
+/** Text-to-image route; takes the raw bytes back (see `image.mjs`). */
+const IMAGE_PATH = '/api/inference/image'
 
 let state = null
 let tokenFlight = null
@@ -241,4 +243,4 @@ export async function probeAccount() {
   return { email: session.email, uid: session.uid, sessionId: session.sessionId }
 }
 
-export { INFERENCE_PATH }
+export { IMAGE_PATH, INFERENCE_PATH }

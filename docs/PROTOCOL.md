@@ -221,6 +221,7 @@ OpenAI → Venice:
 | `tool` message | `user` message with `{"tool_result": {…}}` |
 | `reasoning_effort` | `reasoningMode`: `none|minimal|disabled` → `disabled`, `medium|auto|adaptive` → `adaptive`, else `enabled` |
 | `tools` | prompt text (see §4) |
+| `image_url` part | upload to `/api/v2/agents/media`, then an `input_image` part + multipart resubmission (see §5.1) |
 | `stream` | response framing (upstream is always a stream) |
 
 Venice → OpenAI:
@@ -234,9 +235,89 @@ Venice → OpenAI:
 
 Usage is estimated (`countTokens` ≈ characters/4) because the web endpoint reports none.
 
+## 5.1 Image input
+
+Images never travel inline in the JSON body. Three parts are involved and only
+all three together make the model see the picture (measured 2026-11-10):
+
+1. `POST /api/v2/agents/media`, multipart, one `file` field. Answers
+   `{"mediaId": "…"}`. 25 MB cap, `image/png|jpeg|gif|webp`.
+2. Send the message with an `input_image` part (`media_id`, `mime_type`,
+   `detail: "auto"`). The stream produces no text; it emits a tool step whose
+   arguments carry `media_ids`.
+3. Resubmit the whole conversation as `multipart/form-data`: a `request` text
+   field holding the JSON body, plus one **file field named exactly after each
+   `mediaId`**. Only now does `response.output_text.delta` appear.
+
+| Variant | Text? |
+| --- | --- |
+| `input_image` with an unknown id | no |
+| upload + `input_image`, JSON body | no (tool step only) |
+| + `mediaManifest` (`materialized` true/false, with/without `url`) | no |
+| + a `contentHydration` request field | no |
+| `function_call`/`function_call_output` in the body, still JSON | no |
+| **multipart `request` + file field per `mediaId`, via curl** | **yes** |
+| same multipart via Node `fetch` | 403 Cloudflare HTML |
+
+Notes measured on the way:
+
+* The tool step is named `hydrate_content` while the model has written nothing.
+  When it wrote text first, the same step arrives as a **failed `view_media`
+  call** instead. Both are answered identically, with a `function_call_output`
+  naming every `mediaId` under `items`.
+* `function_call_output.output` is `{"items":{"<mediaId>":{"media_id":"<mediaId>"}}}`;
+  the `function_call` reuses the upstream `call_id`.
+* `previousResponseId`/`previousOutputIndex` from the hydration response are
+  optional in the resubmission (works without them).
+* File field name = the `mediaId`, not `file`. The multipart call must not send
+  `content-type: application/json`; with it the backend answers
+  `Invalid JSON request`.
+* Only the newest user turn is uploaded and hydrated; older turns keep a text
+  marker so the bytes are not resent every turn.
+
+## 5.2 Image generation
+
+```
+POST https://outerface.venice.ai/api/inference/image
+{
+  "model": "z-image-turbo", "prompt": "…",
+  "width": 512, "height": 512, "format": "png",
+  "seed": 12345, "requestId": "<uuid>",
+  "hideWatermark": false, "matureFilter": false
+}
+```
+
+The reply is **raw bytes** (`image/png`, no JSON envelope) - the catalogue marks
+these models `supportsBinaryResponse: true`. `seed`, `requestId`,
+`hideWatermark` and `matureFilter` are all required (`400 Invalid request`
+otherwise). Same route, same Cloudflare rules as §2: HTTP/1.1 through curl, no
+`accept: text/event-stream`.
+
+| Variant | Result |
+| --- | --- |
+| `modelId` in the body | 400 `modelNotFound` |
+| `model` = catalogue id `stable-diffusion-3.5-rev2` / `wai-illu` | 200, but the **default model's** picture comes back - no error |
+| `model` = `apiModelId` (`venice-sd35`, `wai-Illustrious`) | 200 from that model |
+| `/api/v1/image/generate` with a Bearer token | 401 `Authentication failed` |
+| same seed twice | different bytes; the seed only makes runs comparable |
+
+The endpoint resolves models by `apiModelId`, which differs from the catalogue
+id for two models, so `models.mjs` stores the `apiModelId` and the catalogue name
+verbatim. Which models are allowed is decided elsewhere (§6); the proxy exposes
+`POST /v1/images/generations` on top of this (`src/lib/image.mjs`).
+
 ## 6. Free-model catalogue
 
 `src/lib/models.mjs` mirrors the web catalogue entries flagged `usesCredits: false`. The web app fetches that list from `GET /api/app/models` and `GET /api/v2/agents/configuration_options` with the same session; both are useful if you want to regenerate the list automatically (the proxy currently ships a static copy so it works offline and with a dead session).
+
+The same flag decides the five free text-to-image models of §5.2; the other 40
+image models cost credits and stay out.
+
+## 6.1 Rate and capacity
+
+`z-image-turbo` and `chroma` intermittently answer `503 {"error":"modelAtCapacity"}`
+when several requests arrive together (`n: 2` did it twice in a row, sequential
+calls recovered at once). Treat 503 as transient.
 
 ## 7. Version pins
 

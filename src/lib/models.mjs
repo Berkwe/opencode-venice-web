@@ -9,6 +9,10 @@
  *
  * `reasoning: true` marks models that emit reasoning deltas. `context`/`output`
  * are the web catalogue limits, used to build the OpenCode model config.
+ *
+ * `kind: 'image'` marks the text-to-image models: they are served by
+ * `/v1/images/generations` (`src/lib/image.mjs`), not by the chat route. Taken
+ * from the same catalogue run, only the `usesCredits: false` entries.
  */
 export const MODELS = {
   'deepseek-v4-1-flash-uncensored': { name: 'DeepSeek V4.1 Flash Uncensored', context: 524288, output: 131072, reasoning: true },
@@ -41,12 +45,34 @@ export const MODELS = {
   'e2ee-qwen3-8-27b': { name: 'Qwen 3.8 27B', context: 262144, output: 8192, reasoning: true },
   'zai-org-glm-4.6': { name: 'GLM 4.6', context: 198000, output: 16384, reasoning: false },
   'gemma4-uncensored': { name: 'Gemma 4 Uncensored', context: 256000, output: 8192, reasoning: false },
+  // Text-to-image. The catalogue ids are `stable-diffusion-3.5-rev2` and
+  // `wai-illu`, but the image endpoint only knows their `apiModelId`
+  // (`venice-sd35`, `wai-Illustrious`); the short ids fall back to the default
+  // model without an error, so the `apiModelId` is used. `nsfw`/`hentai` follow
+  // the catalogue's `apiUncensored`/hentai flags, `promptLimit` and
+  // `widthHeightDivisor` are its per-model limits.
+  'z-image-turbo': { name: 'Z-Image Turbo', kind: 'image', promptLimit: 7500, divisor: 8, steps: 8 },
+  'venice-sd35': { name: 'Venice SD35', kind: 'image', promptLimit: 1500, divisor: 16, steps: 25 },
+  'lustify-v8': { name: 'Lustify v8', kind: 'image', nsfw: true, promptLimit: 1500, divisor: 8, steps: 30 },
+  'wai-Illustrious': { name: 'Anime (WAI)', kind: 'image', nsfw: true, hentai: true, promptLimit: 1500, divisor: 16, steps: 25 },
+  'chroma': { name: 'Chroma', kind: 'image', nsfw: true, promptLimit: 7500, divisor: 8, steps: 10 },
 }
 
-/** Default model, used by the installer and `sync --default`. Unchanged. */
-export const DEFAULT_MODEL = 'deepseek-v4-1-flash-free'
+/** Default model, used by the installer and `sync --default`. */
+export const DEFAULT_MODEL = 'deepseek-v4-1-flash-uncensored'
 
 /** Cheap model for titles/summaries. */
 export const DEFAULT_SMALL_MODEL = 'qwen3-5-35b-a3b'
 
-export const modelIds = Object.keys(MODELS)
+/** Default image model, used when `/v1/images/generations` gets no known `model`. */
+export const DEFAULT_IMAGE_MODEL = 'z-image-turbo'
+
+/** Chat models only: image models cannot answer a chat turn. */
+export const modelIds = Object.keys(MODELS).filter((id) => MODELS[id].kind !== 'image')
+
+export const imageModelIds = Object.keys(MODELS).filter((id) => MODELS[id].kind === 'image')
+
+// A catalogue refresh can drop the default id; fail at import instead of on the
+// first request (`unknown model` in toVeniceRequest).
+if (!MODELS[DEFAULT_MODEL]) throw new Error(`DEFAULT_MODEL is not in MODELS: ${DEFAULT_MODEL}`)
+if (!MODELS[DEFAULT_IMAGE_MODEL]) throw new Error(`DEFAULT_IMAGE_MODEL is not in MODELS: ${DEFAULT_IMAGE_MODEL}`)
