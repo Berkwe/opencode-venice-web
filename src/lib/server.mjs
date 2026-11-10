@@ -382,7 +382,7 @@ async function handleImages(req, res) {
   try {
     const images = await Promise.all(
       Array.from({ length: count }, () =>
-        generateImage({ model, prompt, size: body.size, seed: body.seed, steps: body.steps, negativePrompt: body.negative_prompt, signal: abort.signal }),
+        generateImage({ model, prompt, size: body.size, seed: body.seed, steps: body.steps, negativePrompt: body.negative_prompt, divisor: MODELS[model].divisor, signal: abort.signal }),
       ),
     )
     return json(res, 200, {

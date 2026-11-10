@@ -23,6 +23,11 @@
   hentai-tuned. `/v1/models` marks them `kind: "image"` and a chat call to one
   fails with a pointer to the image route. The other 40 image models cost credits.
   Protocol: docs/PROTOCOL.md §5.2.
+- **Oversized image requests no longer fail.** The endpoint caps a side at 1344
+  px and the pixel count at 1.5M, and answered `400` (502 here) past either - a
+  hard-coded 1536 meant every large request failed. Sizes are now clamped to those
+  limits and to the model's own divisor, so `1536x1536` returns 1224x1224 instead
+  of an error.
 - `skills/opencode-orchestrator/`: a Claude Code skill that lets Claude plan work,
   scripts close stdin (an open pipe made workers hang before the model was called),
   put a hard time limit on every run, check that the installed `opencode` accepts

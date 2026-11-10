@@ -22,12 +22,30 @@ import { randomUUID } from 'node:crypto'
 import { apiBase, requestTimeoutMs } from './config.mjs'
 import { IMAGE_PATH, SignInError, mintToken, veneziaFetch } from './venice.mjs'
 
-/** `size` strings (OpenAI `1024x1024`) to pixels; anything else falls back to 512². */
-function dimensions(size) {
+/**
+ * `size` strings (OpenAI `1024x1024`) to pixels; anything else falls back to 512².
+ *
+ * The endpoint caps both sides at 1344 and the pixel count at 1.5M, and answers
+ * `400` (as a 502 here) past either - a hard-coded 1536 used to fail every time.
+ * So both limits are applied before sending: sides are clamped to 1344, then the
+ * whole image is scaled down until it fits the pixel budget.
+ */
+const MAX_SIDE = 1344
+const MAX_PIXELS = 1_500_000
+
+function dimensions(size, divisor) {
   const match = /^(\d{2,5})\s*[x×]\s*(\d{2,5})$/i.exec(String(size ?? '').trim())
   if (!match) return { width: 512, height: 512 }
-  const clamp = (value) => Math.min(1536, Math.max(256, Number(value)))
-  return { width: clamp(match[1]), height: clamp(match[2]) }
+  const step = Number.isInteger(divisor) && divisor > 1 ? divisor : 8
+  const clamp = (value) => Math.min(MAX_SIDE, Math.max(256, Math.round(Number(value) / step) * step))
+  let width = clamp(match[1])
+  let height = clamp(match[2])
+  if (width * height > MAX_PIXELS) {
+    const scale = Math.sqrt(MAX_PIXELS / (width * height))
+    width = Math.max(256, Math.floor((width * scale) / step) * step)
+    height = Math.max(256, Math.floor((height * scale) / step) * step)
+  }
+  return { width, height }
 }
 
 /**
@@ -37,10 +55,10 @@ function dimensions(size) {
  * @param {{ model: string, prompt: string, size?: string, seed?: number, steps?: number, negativePrompt?: string }} options
  * @returns {Promise<{ b64: string, contentType: string }>}
  */
-export async function generateImage({ model, prompt, size, seed, steps, negativePrompt, signal } = {}) {
+export async function generateImage({ model, prompt, size, seed, steps, negativePrompt, divisor = 8, signal } = {}) {
   if (!prompt || typeof prompt !== 'string') throw new Error('prompt must not be empty')
 
-  const { width, height } = dimensions(size)
+  const { width, height } = dimensions(size, divisor)
   const timeout = signal
     ? AbortSignal.any([signal, AbortSignal.timeout(requestTimeoutMs)])
     : AbortSignal.timeout(requestTimeoutMs)

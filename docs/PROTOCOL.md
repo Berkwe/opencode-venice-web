@@ -300,11 +300,15 @@ otherwise). Same route, same Cloudflare rules as §2: HTTP/1.1 through curl, no
 | `model` = `apiModelId` (`venice-sd35`, `wai-Illustrious`) | 200 from that model |
 | `/api/v1/image/generate` with a Bearer token | 401 `Authentication failed` |
 | same seed twice | different bytes; the seed only makes runs comparable |
+| `width`/`height` above 1344, or a pixel count above 1,500,000 | 400 `Number must be less than or equal to 1344` / `Total pixel count … must not exceed 1,500,000` |
 
 The endpoint resolves models by `apiModelId`, which differs from the catalogue
 id for two models, so `models.mjs` stores the `apiModelId` and the catalogue name
 verbatim. Which models are allowed is decided elsewhere (§6); the proxy exposes
-`POST /v1/images/generations` on top of this (`src/lib/image.mjs`).
+`POST /v1/images/generations` on top of this (`src/lib/image.mjs`). Sizes are
+clamped to 1344 per side and to the 1.5M pixel budget before sending (to the
+model's `widthHeightDivisor`), so an oversized request is answered with a smaller
+picture rather than a 502.
 
 ## 6. Free-model catalogue
 
