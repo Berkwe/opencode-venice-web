@@ -91,6 +91,7 @@ export function parseHead(buffer) {
  * @param {{ field: string, filename: string, contentType: string, data: Buffer }[]} files
  */
 export function curlMultipartFetch(url, { method = 'POST', headers, fields = {}, files = [], signal } = {}) {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new Error('aborted'))
   const bin = findCurl()
   if (!bin) return Promise.reject(new Error('curl is not installed (needed for the Venice inference route)'))
   if (!url.startsWith('https://')) return Promise.reject(new Error('curl transport only speaks https'))
@@ -176,6 +177,7 @@ export function curlMultipartFetch(url, { method = 'POST', headers, fields = {},
 
 /** `fetch()` lookalike backed by curl; resolves to a Response with a streaming body. */
 export function curlFetch(url, { method = 'GET', headers, body, signal } = {}) {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new Error('aborted'))
   const bin = findCurl()
   if (!bin) return Promise.reject(new Error('curl is not installed (needed for the Venice inference route)'))
   if (!url.startsWith('https://')) return Promise.reject(new Error('curl transport only speaks https'))

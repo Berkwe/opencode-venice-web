@@ -13,6 +13,7 @@ import { writeFileSync } from 'node:fs'
 import { apiBase, debug, dumpFile, host, judgeEnabled, judgeModel, judgeTimeoutMs, port, providerID } from './config.mjs'
 import {
   applyFallback,
+  rejectInvalidCalls,
   buildJudgeRequest,
   countTokens,
   inspectCalls,
@@ -33,6 +34,14 @@ import { generateImage } from './image.mjs'
 import { debugRaw, log, preview, warn } from './log.mjs'
 import { deepStripNulls, repairJsonControlChars } from './sanitize.mjs'
 import { INFERENCE_PATH, SignInError, loadSession, resetSessionCache, upstreamChat } from './venice.mjs'
+
+/** Correlation only: do not log prompts, credentials or tool arguments. */
+export function requestTrace(id, sink = { log, warn }) {
+  return {
+    log: (...parts) => sink.log(`[req=${id}]`, ...parts),
+    warn: (...parts) => sink.warn(`[req=${id}]`, ...parts),
+  }
+}
 
 const json = (res, status, payload) => {
   res.writeHead(status, { 'content-type': 'application/json' })
@@ -148,7 +157,10 @@ export async function* collectStream(upstreamBody, mapping, chunk, { stopServerL
       state.reasoning += event.delta ?? ''
       return chunk({ reasoning_content: event.delta ?? '' })
     }
-    if (event.type === 'response.completed') state.terminal = true
+    if (event.type === 'response.completed') {
+      state.terminal = true
+      return STOP
+    }
     if (event.type === 'response.incomplete') throw new Error('Venice generation was incomplete')
     return null
   }
@@ -182,7 +194,7 @@ const STOP = Symbol('stop')
  * native call; past that it is looping on "Tool not found" (measured: every
  * 10-step response gave up without a result).
  */
-const SERVER_LOOP_STEPS = 3
+const SERVER_LOOP_STEPS = 12
 
 /**
  * Whether Venice's own agent loop has run long enough to be cut. Past
@@ -193,6 +205,9 @@ const SERVER_LOOP_STEPS = 3
  */
 function serverLoopReached(state) {
   if (state.steps.size > SERVER_LOOP_STEPS) return true
+  // Reasoning alone is not a native call. Once detected_tools contains an
+  // actual call, however, thinking must not disable the loop guard: Venice
+  // cannot execute the external client's tools in either reasoning mode.
   return state.steps.size > 1 && state.nativeTools.size > 0 && !state.text
 }
 
@@ -201,7 +216,8 @@ function serverLoopReached(state) {
  * failure (network, timeout, an unreadable verdict) returns `null`, which keeps
  * the reply: the judge can only add a retry, never block an answer.
  */
-async function askJudge(body, message, signal) {
+async function askJudge(body, message, signal, trace) {
+  const { log, warn } = trace
   const model = judgeModel || body.model
   const timeout = AbortSignal.timeout(judgeTimeoutMs)
   try {
@@ -237,7 +253,8 @@ async function askJudge(body, message, signal) {
  * upstream attempt (free on the web plan). `preferAnswer()` decides whether the
  * retry replaces the first answer, so a retry can never blank out a good reply.
  */
-async function* openaiChunks(body, mapping, upstreamBody, signal) {
+async function* openaiChunks(body, mapping, upstreamBody, signal, trace) {
+  const { log, warn } = trace
   const id = `chatcmpl-${randomUUID().replaceAll('-', '')}`
   const created = Math.floor(Date.now() / 1000)
   const chunk = (delta, finish = null, extra = {}) => ({
@@ -257,7 +274,10 @@ async function* openaiChunks(body, mapping, upstreamBody, signal) {
   if (mapping.emulatedTools) {
     const available = [...mapping.toolNames]
     let attempt = 0
+    let actualReasoning = mapping.request.reasoningMode
+    let recoveryRequest = mapping.request
     const read = (text, collected) => {
+      log(`attempt=${attempt + 1} received • reasoning=${actualReasoning} • steps=${collected.steps.size} • native=${[...collected.nativeTools].join(',') || '-'} • text_chars=${text.length} • reasoning_chars=${collected.reasoning.length} • terminal=${collected.terminal} • loop=${collected.serverLoop}`)
       // every attempt, not only the one that is kept: discarded retries are where
       // the odd replies hide
       debugRaw(
@@ -291,17 +311,24 @@ async function* openaiChunks(body, mapping, upstreamBody, signal) {
       if (decision.judge) {
         if (!judgeEnabled || judged >= 2) break
         judged++
-        const verdict = await askJudge(body, message, signal)
+        const verdict = await askJudge(body, message, signal, trace)
         if (verdict) log(`  ~ judge: ${verdict.verdict}${verdict.reason ? ` (${preview(verdict.reason, 100)})` : ''}`)
         decision = judgeDecision(verdict?.verdict)
       }
       if (!decision.retry) break
       if (!decision.reason.startsWith('judge:') && formatRetries++ >= 2) break
 
-      log(`  ~ ${decision.reason}, retrying...`)
+      log(`  ~ ${decision.reason}, retrying...${decision.reason === 'venice tool loop' ? ' (recovery: thinking disabled)' : ''}`)
       try {
-        const retryResponse = await upstreamChat(withRetryReminder(mapping.request, decision.reminder), INFERENCE_PATH, signal)
-        if (!retryResponse.ok) break
+        recoveryRequest = withRetryReminder(recoveryRequest, decision.reminder)
+        actualReasoning = recoveryRequest.reasoningMode
+        log(`attempt=${attempt + 1} send • reasoning=${actualReasoning} • trigger=${decision.reason}`)
+        const retryResponse = await upstreamChat(recoveryRequest, INFERENCE_PATH, signal)
+        if (!retryResponse.ok) {
+          await retryResponse.body?.cancel()
+          warn(`  ~ retry: HTTP ${retryResponse.status}, keeping the reply`)
+          break
+        }
         // every retry stops a Venice loop, the last one included: a loop read to
         // the end gives up without an answer, and by then the retry budget is
         // gone so nothing would rescue it
@@ -324,6 +351,7 @@ async function* openaiChunks(body, mapping, upstreamBody, signal) {
     }
 
     // Never forward a blank assistant turn: it is invisible in the client.
+    rejectInvalidCalls(message)
     applyFallback(message, state.text)
   }
 
@@ -337,13 +365,13 @@ async function* openaiChunks(body, mapping, upstreamBody, signal) {
     contentForUsage = message.content ?? ''
     if (message.tool_calls) {
       finish = 'tool_calls'
-      log(`  <- tools: ${message.tool_calls.map((call) => `${call.function.name}(${call.function.arguments.slice(0, 80)})`).join(' | ')}`)
+      log(`  <- tools: ${message.tool_calls.map((call) => `${call.function.name}(args_chars=${call.function.arguments.length})`).join(' | ')}`)
       yield chunk({
         content: message.content || '',
         tool_calls: message.tool_calls.map((call, index) => ({ index, ...call })),
       })
     } else {
-      log(`  <- no tools${message.status ? ` • status ${message.status}` : ''} • text: ${preview(message.content ?? '', 110)}`)
+      log(`  <- no tools${message.status ? ` • status ${message.status}` : ''} • text_chars=${(message.content ?? '').length} • recovery_failed=${!!message.serverLoop}`)
       yield chunk({ content: message.content ?? '' })
     }
   }
@@ -378,6 +406,11 @@ async function handleImages(req, res) {
 
   const abort = new AbortController()
   req.on('aborted', () => abort.abort())
+  // A complete POST can outlive its client: req.aborted does not cover a
+  // disconnect while the response is streaming or waiting for upstream.
+  res.once('close', () => {
+    if (!res.writableEnded) abort.abort()
+  })
 
   try {
     const images = await Promise.all(
@@ -396,6 +429,15 @@ async function handleImages(req, res) {
 }
 
 async function handleChat(req, res) {
+  const requestId = randomUUID()
+  const started = Date.now()
+  const trace = requestTrace(requestId)
+  const { log, warn } = trace
+  res.setHeader('x-request-id', requestId)
+  res.once('finish', () => log(`finished • HTTP=${res.statusCode} • elapsed_ms=${Date.now() - started}`))
+  res.once('close', () => {
+    if (!res.writableFinished) warn(`client disconnected • elapsed_ms=${Date.now() - started}`)
+  })
   const body = await readJson(req)
   const mapping = toVeniceRequest(body)
   const imageMsgs = imageMessages(mapping.request)
@@ -419,11 +461,16 @@ async function handleChat(req, res) {
 
   const names = [...mapping.toolNames]
   log(
-    `-> ${body.model} • ${body.messages?.length ?? 0} msgs • ${names.length} tools${names.length ? ` [${names.join(',')}]` : ''} • stream=${body.stream !== false}`,
+    `-> ${body.model} • ${body.messages?.length ?? 0} msgs • ${names.length} tools${names.length ? ` [${names.join(',')}]` : ''} • stream=${body.stream !== false} • reasoning=${mapping.request.reasoningMode}`,
   )
 
   const abort = new AbortController()
   req.on('aborted', () => abort.abort())
+  // A complete POST can outlive its client: req.aborted does not cover a
+  // disconnect while the response is streaming or waiting for upstream.
+  res.once('close', () => {
+    if (!res.writableEnded) abort.abort()
+  })
 
   let upstream
   try {
@@ -445,7 +492,7 @@ async function handleChat(req, res) {
     return openaiError(res, upstream.status, `${apiBase} responded HTTP ${upstream.status}: ${text.slice(0, 400)}`)
   }
 
-  const chunks = openaiChunks(body, mapping, upstream.body, abort.signal)
+  const chunks = openaiChunks(body, mapping, upstream.body, abort.signal, trace)
 
   if (body.stream === false) {
     const message = { role: 'assistant', content: '' }

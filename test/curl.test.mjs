@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { headerLines, isCloudflareBlock, parseHead } from '../src/lib/curl.mjs'
+import { curlFetch, curlMultipartFetch, headerLines, isCloudflareBlock, parseHead } from '../src/lib/curl.mjs'
 
 test('headerLines leaves the user agent to -A and disables Expect', () => {
   const lines = headerLines({ 'User-Agent': 'UA', Authorization: 'Bearer t', 'content-type': 'application/json' })
@@ -41,4 +41,16 @@ test('isCloudflareBlock spots the html block page and the challenge header only 
   assert.equal(isCloudflareBlock(403, new Headers({ 'cf-mitigated': 'challenge' })), true)
   assert.equal(isCloudflareBlock(403, new Headers({ 'content-type': 'application/json' })), false)
   assert.equal(isCloudflareBlock(200, new Headers({ 'content-type': 'text/html' })), false)
+})
+
+test('pre-aborted transports reject before headers, files or curl are touched', async () => {
+  const controller = new AbortController()
+  const reason = new Error('cancelled before request')
+  controller.abort(reason)
+  // Invalid headers would throw synchronously if file/header setup ran first.
+  for (const transport of [curlFetch, curlMultipartFetch]) {
+    await assert.rejects(transport('https://example.invalid', {
+      signal: controller.signal, headers: { bad: 'invalid\nheader' },
+    }), error => error === reason)
+  }
 })

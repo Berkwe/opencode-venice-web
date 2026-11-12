@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { collectStream } from '../src/lib/server.mjs'
-import { NATIVE_CALL_REMINDER, preferAnswer, serverLoopMessage, shouldRetry } from '../src/lib/emulate.mjs'
+import { collectStream, requestTrace } from '../src/lib/server.mjs'
+import { NATIVE_CALL_REMINDER, rejectInvalidCalls, applyFallback, withRetryReminder, preferAnswer, serverLoopMessage, shouldRetry } from '../src/lib/emulate.mjs'
 
 const sse = (events, { close = true } = {}) => {
   const text = events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join('')
@@ -111,4 +111,94 @@ test('preferAnswer: any real reply beats a stopped loop', () => {
   const answer = { content: 'Toplam 20', tool_calls: null, sawEnvelope: true }
   assert.equal(preferAnswer(answer, serverLoopMessage()), true)
   assert.equal(preferAnswer(serverLoopMessage(), answer), false)
+})
+
+for (const reasoningMode of ['enabled', 'adaptive']) {
+  test(`collectStream cuts native tool loops with reasoning ${reasoningMode}`, async () => {
+    const events = [
+      { type: 'response.reasoning_text.delta', delta: 'I need shell_exec' },
+      ...step(0, 'shell_exec'), ...step(1, 'shell_exec'),
+      ...message(2, 'All tools returned Tool not found'),
+    ]
+    const { body, wasCancelled } = sse(events, { close: false })
+    const state = await drain(collectStream(body,
+      { ...mapping, request: { modelId: 'm', reasoningMode } }, chunk,
+      { stopServerLoop: true }))
+    assert.equal(state.serverLoop, true)
+    assert.equal(state.steps.size, 2)
+    assert.equal(state.text, '')
+    assert.equal(state.reasoning, 'I need shell_exec')
+    assert.equal(wasCancelled(), true)
+  })
+
+  test(`collectStream preserves reasoning without native calls (${reasoningMode})`, async () => {
+    const events = [
+      { type: 'response.reasoning_text.delta', delta: 'Thinking' },
+      ...[0, 1, 2].map(n => ({ type: 'response.output_item.added', output_index: n,
+        item: { type: 'veniceai:tool_call_generation', id: `step-${n}` } })),
+      ...message(3, '{"content":"","status":"continue","tool_calls":[{"name":"shell_exec","arguments":{}}]}'),
+    ]
+    const state = await drain(collectStream(sse(events).body,
+      { ...mapping, request: { modelId: 'm', reasoningMode } }, chunk,
+      { stopServerLoop: true }))
+    assert.equal(state.serverLoop, false)
+    assert.equal(state.terminal, true)
+    assert.match(state.text, /shell_exec/)
+    assert.equal(state.reasoning, 'Thinking')
+  })
+}
+
+test('native loop recovery disables thinking without mutating original request', () => {
+  for (const reasoningMode of ['enabled', 'adaptive']) {
+    const request = { reasoningMode, messages: [], tools: [], clientTools: [] }
+    const retried = withRetryReminder(request, NATIVE_CALL_REMINDER)
+    assert.equal(retried.reasoningMode, 'disabled')
+    assert.equal(request.reasoningMode, reasoningMode)
+    assert.equal(request.messages.length, 0)
+    assert.match(retried.messages.at(-1).content[0].text, /ONLY way/)
+    assert.equal(withRetryReminder(request, 'format only').reasoningMode, reasoningMode)
+  }
+})
+
+test('exhausted native loop reports recovery failure, not empty reply or tool failure', () => {
+  const result = applyFallback(serverLoopMessage(), '')
+  assert.match(result.content, /Proxy tool-call recovery failed/)
+  assert.match(result.content, /No external tool call was dispatched for this request/)
+  assert.doesNotMatch(result.content, /empty reply/)
+})
+
+test('completed response stops without waiting for upstream EOF', async () => {
+  const { body, wasCancelled } = sse(message(0, '{"content":"done","tool_calls":[]}'), { close: false })
+  const state = await drain(collectStream(body, mapping, chunk))
+  assert.equal(state.terminal, true)
+  assert.match(state.text, /done/)
+  assert.equal(wasCancelled(), true)
+})
+
+test('retry exhaustion never emits known invalid tool calls', () => {
+  const call = { function: { name: 'missing_tool', arguments: '{}' } }
+  const message = { content: '', tool_calls: [call], problems: ['unknown tool'] }
+  rejectInvalidCalls(message)
+  assert.equal(message.tool_calls, null)
+  assert.equal(message.status, 'done')
+  assert.match(message.content, /unknown tool/)
+  const valid = { tool_calls: [call], problems: [] }
+  assert.equal(rejectInvalidCalls(valid).tool_calls.length, 1)
+})
+
+test('request traces separate concurrent requests on logs and warnings', () => {
+  const entries = []
+  const sink = { log: (...args) => entries.push(args), warn: (...args) => entries.push(args) }
+  requestTrace('a', sink).log('attempt=1')
+  requestTrace('b', sink).warn('failed')
+  assert.deepEqual(entries, [['[req=a]', 'attempt=1'], ['[req=b]', 'failed']])
+})
+
+test('cumulative retries preserve recovery mode and previous reminders', () => {
+  const request = { reasoningMode: 'enabled', messages: [] }
+  const first = withRetryReminder(request, NATIVE_CALL_REMINDER)
+  const second = withRetryReminder(first, 'retry JSON')
+  assert.equal(second.reasoningMode, 'disabled')
+  assert.equal(second.messages.length, 2)
+  assert.equal(request.messages.length, 0)
 })
