@@ -117,7 +117,8 @@ test('toVeniceRequest: hides the Code Mode wrappers when real tools exist', () =
     messages: [{ role: 'user', content: 'hi' }],
     tools: [tool('read'), tool('execute'), tool('search')],
   })
-  assert.deepEqual([...mapping.toolNames], ['read'])
+  // `view_media` rides along: models ask for it whenever an image is in the turn
+  assert.deepEqual([...mapping.toolNames], ['read', 'view_media'])
   assert.equal(mapping.emulatedTools, true)
 })
 
@@ -127,7 +128,7 @@ test('toVeniceRequest: keeps wrappers when they are the only tools', () => {
     messages: [{ role: 'user', content: 'hi' }],
     tools: [tool('execute')],
   })
-  assert.deepEqual([...mapping.toolNames], ['execute'])
+  assert.deepEqual([...mapping.toolNames], ['execute', 'view_media'])
 })
 
 test('toVeniceRequest: appends the format reminder as the last user message', () => {
@@ -642,4 +643,30 @@ test('preferAnswer: with replaceAnswer a real retry answer replaces the first on
   // never with a blank retry, a prose retry or a call with problems
   assert.equal(preferAnswer(emptyEnvelope(), first, { replaceAnswer: true }), false)
   assert.equal(preferAnswer({ ...retry, sawEnvelope: false }, first, { replaceAnswer: true }), false)
+})
+
+// Models ask for `view_media` as soon as an image is in the turn. It is not in the
+// client's list, so without the extra schema every such call was rejected and the
+// turn went through a retry (measured 5/20 rejected, 0/20 after offering it).
+test('toVeniceRequest: offers view_media so an image turn can ask for it', () => {
+  const mapping = toVeniceRequest({
+    model: Object.keys(MODELS)[0],
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [tool('read')],
+  })
+  assert.equal(mapping.toolNames.has('view_media'), true)
+  assert.deepEqual(mapping.toolSchemas.get('view_media').required, ['media_ids'])
+})
+
+test('toVeniceRequest: does not add view_media twice or without tools', () => {
+  const twice = toVeniceRequest({
+    model: Object.keys(MODELS)[0],
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [tool('read'), tool('view_media')],
+  })
+  assert.deepEqual([...twice.toolNames], ['read', 'view_media'])
+
+  const none = toVeniceRequest({ model: Object.keys(MODELS)[0], messages: [{ role: 'user', content: 'hi' }] })
+  assert.equal(none.toolNames.has('view_media'), false)
+  assert.equal(none.emulatedTools, false)
 })

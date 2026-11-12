@@ -155,9 +155,20 @@ export function shouldRetry({ message, lastRole, available = [] }) {
  * client, so the last resort is the raw text and then a marker. Mutates and
  * returns the message.
  */
+/** Fail closed after retry exhaustion; never dispatch a call already rejected by validation. */
+export function rejectInvalidCalls(message) {
+  if (!message.tool_calls || !message.problems?.length) return message
+  message.content = `Proxy rejected invalid tool calls; no calls from this reply were dispatched: ${message.problems.join('; ')}`
+  message.tool_calls = null
+  message.status = 'done'
+  return message
+}
+
 export function applyFallback(message, rawText) {
   if (!isEmptyAnswer(message)) return message
-  message.content = fallbackAnswerText(rawText) || EMPTY_MARKER
+  message.content = fallbackAnswerText(rawText) || (message.serverLoop
+    ? 'Proxy tool-call recovery failed: Venice attempted native tools instead of returning the external tool-call JSON. No external tool call was dispatched for this request. Earlier calls in this conversation may have succeeded.'
+    : EMPTY_MARKER)
   return message
 }
 
@@ -366,6 +377,31 @@ export function toVeniceRequest(body) {
   const direct = tools.filter((tool) => tool?.function?.name && !WRAPPER_TOOLS.has(tool.function.name))
   if (direct.length) tools = direct
 
+  // Models ask for `view_media` whenever an image is in the turn, but the
+  // client never advertises it: the bytes already ride along as `input_image`
+  // parts, so nothing has to be read back. Left out of the list, every such
+  // call was rejected as "there is no tool named view_media" and the turn went
+  // through a retry (measured 5/20 with an image in the turn, 0/20 once the
+  // name was offered). The schema is only there to make the call valid; the
+  // call itself is answered by the proxy and never reaches the client.
+  if (tools.length && !tools.some((tool) => tool?.function?.name === 'view_media')) {
+    tools = [
+      ...tools,
+      {
+        type: 'function',
+        function: {
+          name: 'view_media',
+          description: 'Read an image that is attached to the conversation.',
+          parameters: {
+            type: 'object',
+            properties: { media_ids: { type: 'array', items: { type: 'string' } } },
+            required: ['media_ids'],
+          },
+        },
+      },
+    ]
+  }
+
   const names = new Set()
   for (const tool of tools) {
     if (tool?.type !== 'function' || !tool.function?.name) throw new Error('only function tools are supported')
@@ -494,6 +530,9 @@ export function imageMessages(request) {
 export function withRetryReminder(request, reminder = RETRY_REMINDER) {
   return {
     ...request,
+    // Native tool routing can persist during reasoning despite the JSON prompt.
+    // Only recovery attempts disable reasoning; the original request is untouched.
+    ...(reminder === NATIVE_CALL_REMINDER ? { reasoningMode: 'disabled' } : {}),
     messages: [
       ...request.messages,
       {
