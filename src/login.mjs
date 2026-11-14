@@ -35,6 +35,8 @@ const options = {
   timeoutMs: Number(flag('timeout', 15 * 60)) * 1000,
 }
 
+const UA_FALLBACK = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+
 const guided = !options.cookie && !options.profile
 
 const requestHeaders = (client, userAgent) => ({
@@ -80,6 +82,16 @@ async function collectCookie() {
       browser: options.browser,
       timeoutMs: options.timeoutMs,
       onTick: (note) => log(note),
+      // Clerk sets an anonymous cookie on page load and swaps it after the
+      // sign-in; only a cookie that resolves a session is accepted.
+      verify: async ({ client, userAgent }) => {
+        try {
+          await resolveAccount(client, userAgent ?? UA_FALLBACK)
+          return true
+        } catch {
+          return false
+        }
+      },
     })
     try {
       return { ...found, cleanup: found.cleanup }

@@ -29,7 +29,7 @@ export const BROWSERS = {
   chromium: { mac: 'Chromium', linux: 'chromium', app: '/Applications/Chromium.app', keychain: 'Chromium Safe Storage', secret: ['application', 'chromium'], label: 'Chromium' },
 }
 
-const COOKIE_HOSTS = ['.clerk.venice.ai', 'clerk.venice.ai']
+const COOKIE_HOSTS = ['.clerk.venice.ai', 'clerk.venice.ai', '.venice.ai', 'venice.ai']
 
 const profiles = (name) => (name ? [name] : ['Default', 'Profile 1', 'Profile 2', 'Profile 3'])
 
@@ -108,8 +108,10 @@ function decrypt(value, key) {
   const prefix = payload.subarray(0, 3).toString()
   if (prefix === 'v10' || prefix === 'v11') payload = payload.subarray(3)
   const decipher = createDecipheriv('aes-128-cbc', key, Buffer.alloc(16, 0x20))
-  // Chromium >= 130 puts a SHA256 of the host key in front of the plaintext.
   const out = Buffer.concat([decipher.update(payload), decipher.final()])
+  // Chromium >= 130 prefixes a SHA256 of the host key. Only a payload long
+  // enough to hold it plus a non-empty value gets trimmed, so a short cookie
+  // never loses its first characters.
   const body = out.length > 32 ? out.subarray(32) : out
   return body.toString('utf8')
 }
@@ -142,6 +144,13 @@ export function clientFromCookieDb(dbPath, name) {
   const passwords = passwordsFor(browser)
   const copy = path.join(mkdtempSync(path.join(tmpdir(), 'venice-cookie-')), 'Cookies')
   copyFileSync(dbPath, copy)
+  // Chromium keeps recent writes in the rollback journal / WAL until it commits.
+  // Without those side files the copy can look older than it is and a fresh
+  // cookie appears missing.
+  for (const suffix of ['-journal', '-wal']) {
+    const side = `${dbPath}${suffix}`
+    if (existsSync(side)) copyFileSync(side, `${copy}${suffix}`)
+  }
 
   const rows = readCookies(copy, COOKIE_HOSTS)
   let client = null
@@ -152,6 +161,17 @@ export function clientFromCookieDb(dbPath, name) {
   }
   if (!client) return null
   return { client, userAgent: browserUserAgent(browser), source: browser.label }
+}
+
+/**
+ * True when the given cookie database belongs to a profile that is in use right
+ * now: a live Chromium writes a `SingletonLock` next to it and appends a
+ * `-journal`/`-wal` file while the DB is open. Copying the store while the
+ * browser still holds it can yield an empty read.
+ */
+export function profileIsLive(dbPath) {
+  const dir = path.dirname(dbPath)
+  return ['SingletonLock', 'SingletonSocket', 'SingletonCookie'].some((name) => existsSync(path.join(dir, name)))
 }
 
 function readFromBrowser(name, profile) {

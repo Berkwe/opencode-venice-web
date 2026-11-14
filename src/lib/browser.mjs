@@ -76,8 +76,50 @@ export function findLauncher(name) {
   )
 }
 
+/**
+ * Makes sure a display exists AND that we are allowed to draw on it.
+ *
+ * Over SSH the DISPLAY variable is usually missing even though a desktop
+ * session is running, and X refuses the connection without the matching
+ * Xauthority file. Both are recovered here: DISPLAY falls back to an existing
+ * X socket, and the lightdm/gdm/user auth file is picked up when present.
+ *
+ * Only sockets that really exist count. A stale DISPLAY (`:0` while Xorg runs
+ * on `:1`) is corrected the same way instead of being trusted blindly.
+ */
+function ensureDisplay() {
+  if (process.platform === 'darwin') return
+  if (process.env.WAYLAND_DISPLAY) return
+
+  const liveSocket = [0, 1].find((num) => existsSync(`/tmp/.X11-unix/X${num}`))
+  if (liveSocket === undefined) return
+
+  const current = (process.env.DISPLAY ?? '').match(/^:(\d+)/)
+  if (!current || !existsSync(`/tmp/.X11-unix/X${current[1]}`)) {
+    process.env.DISPLAY = `:${liveSocket}`
+  }
+  const num = (process.env.DISPLAY.match(/:(\d+)/) ?? [])[1] ?? String(liveSocket)
+
+  if (!process.env.XAUTHORITY) {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : 0
+    const candidates = [
+      `/var/run/lightdm/root/:${num}`,
+      `/run/user/${uid}/gdm/Xauthority`,
+      path.join(homedir(), '.Xauthority'),
+      `/run/user/${uid}/.mutter-Xwaylandauth`,
+    ]
+    for (const file of candidates) {
+      if (existsSync(file)) {
+        process.env.XAUTHORITY = file
+        break
+      }
+    }
+  }
+}
+
 /** Throws with a readable reason when there is no display to draw the window on. */
 export function assertDisplay() {
+  ensureDisplay()
   if (process.platform === 'darwin') return
   if (process.env.DISPLAY || process.env.WAYLAND_DISPLAY) return
   throw new Error(
@@ -90,8 +132,12 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 /**
  * Opens `browser` on venice.ai and resolves with the `__client` cookie once the
  * user closed the window. `onTick` gets a heartbeat every poll.
+ *
+ * `verify` (optional) is called with each candidate cookie and must resolve
+ * `true` only when that cookie really carries a signed-in session. Without it the
+ * first `__client` in the store wins, which may be the anonymous one.
  */
-export async function guidedSignIn({ browser, timeoutMs = MAX_WAIT_MS, onTick } = {}) {
+export async function guidedSignIn({ browser, timeoutMs = MAX_WAIT_MS, onTick, verify, closeOnConfirm = true } = {}) {
   assertDisplay()
   const { browser: name, bin } = findLauncher(browser)
   const label = BROWSERS[name].label
@@ -112,7 +158,28 @@ export async function guidedSignIn({ browser, timeoutMs = MAX_WAIT_MS, onTick } 
   log(`opening ${label} - sign in to venice.ai, then close the window`)
   log(`profile: ${profileDir}`)
 
-  const child = spawn(bin, args, { stdio: 'ignore', detached: false })
+  // detached + unref: the window has to outlive the ssh shell that started it,
+  // otherwise the whole child tree dies and the sign-in never happens.
+  const env = { ...process.env }
+  const child = spawn(bin, args, { stdio: 'ignore', detached: true, env })
+  child.unref()
+  // Once the session is confirmed the window has done its job; close it.
+  const stop = (proc) => {
+    try {
+      proc.kill('SIGTERM')
+    } catch {
+      /* already gone */
+    }
+    const hard = setTimeout(() => {
+      try {
+        process.kill(-proc.pid, 'SIGKILL')
+      } catch {
+        /* already gone */
+      }
+    }, 2500)
+    hard.unref?.()
+  }
+
   let exitCode = null
   let spawnError = null
   child.on('exit', (code) => {
@@ -124,21 +191,56 @@ export async function guidedSignIn({ browser, timeoutMs = MAX_WAIT_MS, onTick } 
 
   let deadline = Date.now() + timeoutMs
   let seen = null
+  let confirmed = false
   let ticks = 0
+
+  // Clerk writes an anonymous `__client` on the first page load and replaces it
+  // once the sign-in completes, so the store is re-read on every tick; latching
+  // on the first hit hands back a client that carries no session.
+  const read = () => {
+    try {
+      return clientFromCookieDb(profileDir, name)
+    } catch {
+      return null
+    }
+  }
+
+  const check = async (candidate) => {
+    if (!candidate) return false
+    if (!verify) return true
+    try {
+      return (await verify(candidate)) === true
+    } catch {
+      return false
+    }
+  }
 
   while (true) {
     await sleep(POLL_MS)
     ticks += 1
+    const seconds = Math.round((ticks * POLL_MS) / 1000)
     if (spawnError) throw new Error(`could not start ${label}: ${spawnError.message}`)
 
-    if (!seen) {
-      try {
-        seen = clientFromCookieDb(profileDir, name)
-      } catch {
-        /* the db may be locked or half written; keep polling */
+    const fresh = read()
+    if (fresh) {
+      seen = fresh
+      const was = confirmed
+      if (!confirmed) confirmed = await check(fresh)
+      if (confirmed !== was || seconds % 10 === 0) {
+        onTick?.(
+          confirmed
+            ? `signed-in session found after ${seconds}s - close the window when done`
+            : `cookie present after ${seconds}s, waiting for the sign-in to complete`,
+        )
       }
     }
-    if (seen) onTick?.(`cookie found after ${Math.round((ticks * POLL_MS) / 1000)}s`)
+
+    if (confirmed && closeOnConfirm) {
+      onTick?.(`signed in - closing the ${label} window`)
+      stop(child)
+      await sleep(1500)
+      break
+    }
 
     if (exitCode !== null) break
     if (Date.now() > deadline) {
@@ -148,16 +250,19 @@ export async function guidedSignIn({ browser, timeoutMs = MAX_WAIT_MS, onTick } 
   }
 
   // One last read: the browser writes the cookie store right before exiting.
-  if (!seen) {
-    try {
-      seen = clientFromCookieDb(profileDir, name)
-    } catch {
-      /* fall through to the error below */
-    }
+  const last = read()
+  if (last) {
+    seen = last
+    confirmed = await check(last)
   }
 
   if (!seen) {
     throw new Error(`${label} closed before a venice.ai session was stored; run the sign-in again`)
+  }
+  if (verify && !confirmed) {
+    throw new Error(
+      'a venice.ai cookie was stored but no account is signed in on it; open the window again and finish the sign-in before closing it',
+    )
   }
 
   const { client, userAgent } = seen

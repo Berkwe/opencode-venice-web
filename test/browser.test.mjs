@@ -34,7 +34,23 @@ test('assertDisplay accepts an X session', () => {
 })
 
 test('assertDisplay explains the manual fallback when there is no display', () => {
-  withDisplay({}, () => assert.throws(() => assertDisplay(), /no display .*--cookie/))
+  // ensureDisplay() probes the real X sockets, so the check is only meaningful
+  // on a machine without one (a desktop box legitimately resolves :0).
+  const noXSocket = ![0, 1].some((num) => existsSync(`/tmp/.X11-unix/X${num}`))
+  withDisplay({}, () => {
+    if (noXSocket) assert.throws(() => assertDisplay(), /no display .*--cookie/)
+    else assert.doesNotThrow(() => assertDisplay())
+  })
+})
+
+test('assertDisplay falls back to an existing X socket over SSH', () => {
+  const socket = [0, 1].find((num) => existsSync(`/tmp/.X11-unix/X${num}`))
+  if (socket === undefined) return
+  withDisplay({}, () => {
+    assert.doesNotThrow(() => assertDisplay())
+    assert.equal(process.env.DISPLAY, `:${socket}`)
+    delete process.env.DISPLAY
+  })
 })
 
 test('findLauncher rejects an unknown browser name', () => {
