@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **`install.sh` never leaves you without a session silently.** Without a stored
+  session it now prints the exact sign-in steps (with the real install path) and
+  tells you that `--login` does it right away; with a session it says so and
+  skips the browser. Previously a fresh install just ended and the proxy answered
+  `401` until you found `login.mjs` yourself.
 - **Signing in opens a browser.** `login.mjs` no longer needs a browser that is
   already signed in: it starts a Chromium-family browser on a throwaway profile,
   waits until the window is closed, then reads the `__client` cookie out of that

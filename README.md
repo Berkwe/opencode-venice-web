@@ -120,6 +120,8 @@ The catalogue lives in [`src/lib/models.mjs`](src/lib/models.mjs); edit it and r
 
 `install.sh` also understands `--uninstall` (`--purge` deletes the stored session too).
 
+If no session is stored yet, `install.sh` prints the exact sign-in steps at the end instead of leaving you with a proxy that answers 401. Pass `--login` to let it open the sign-in browser right away.
+
 ---
 
 ## Configuration

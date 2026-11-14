@@ -100,8 +100,14 @@ export async function guidedSignIn({ browser, timeoutMs = MAX_WAIT_MS, onTick } 
   const profileDir = path.join(tmpdir(), `venice-web-signin-${process.pid}-${Date.now()}`)
   mkdirSync(profileDir, { recursive: true })
 
-  const args = [`--user-data-dir=${profileDir}`, '--no-first-run', '--no-default-browser-check', SIGN_IN_URL]
-  if (process.platform !== 'darwin') args.unshift('--new-window')
+  const args = [`--user-data-dir=${profileDir}`, '--no-first-run', '--no-default-browser-check']
+  // Chromium refuses to start as root (chroot, container, plain root shell)
+  // without this; the exit code is 1 and the window never appears.
+  if (typeof process.getuid === 'function' && process.getuid() === 0) args.push('--no-sandbox')
+  // Keyring is often empty on a fresh box; basic keeps the cookie readable.
+  if (process.platform === 'linux') args.push('--password-store=basic')
+  if (process.platform !== 'darwin') args.push('--new-window')
+  args.push(SIGN_IN_URL)
 
   log(`opening ${label} - sign in to venice.ai, then close the window`)
   log(`profile: ${profileDir}`)

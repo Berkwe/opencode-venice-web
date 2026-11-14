@@ -186,7 +186,7 @@ fi
 
 # ------------------------------------------------------------------- sign in
 
-if [ "$DO_LOGIN" = "1" ] || [ ! -f "$CONFIG_DIR/session.json" ]; then
+if [ "$DO_LOGIN" = "1" ]; then
   say ""
   say "signing in - a browser window opens; sign in to venice.ai and close it"
   if node "$INSTALL_DIR/src/login.mjs"; then
@@ -198,8 +198,34 @@ if [ "$DO_LOGIN" = "1" ] || [ ! -f "$CONFIG_DIR/session.json" ]; then
   else
     die "sign-in failed: sign in to venice.ai in the browser window, or pass --cookie/--ua"
   fi
+elif [ ! -f "$CONFIG_DIR/session.json" ]; then
+  # Not signed in yet. Never leave the user guessing - print the exact steps.
+  say ""
+  say "NOT SIGNED IN YET - the proxy cannot reach Venice without a session."
+  say "do the sign-in now, then verify:   (it takes one browser window)"
+  say ""
+  say "  1) node $INSTALL_DIR/src/login.mjs"
+  say "     (opens venice.ai; sign in, then close the window)"
+  say ""
+  say "  2) node $INSTALL_DIR/src/doctor.mjs"
+  say ""
+  if [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+    say "no display in this shell, so step 1 needs a desktop session or a cookie:"
+    say "  node $INSTALL_DIR/src/login.mjs --cookie "__client=..." --ua "...""
+    say ""
+  fi
+  say "or re-run this installer with --login to do the sign-in right away:"
+  say "  ./install.sh --login"
+else
+  say ""
+  say "already signed in ($CONFIG_DIR/session.json) - skipping the sign-in"
+  say "to sign in again:  node $INSTALL_DIR/src/login.mjs"
 fi
 
 say ""
 say "finished. verify with:  node $INSTALL_DIR/src/doctor.mjs"
-say "then restart OpenCode and choose a model such as venice-web/deepseek-v4-1-flash-free"
+if [ -f "$CONFIG_DIR/session.json" ]; then
+  say "then restart OpenCode and choose a model such as venice-web/deepseek-v4-1-flash-free"
+else
+  say "after the sign-in, restart OpenCode and choose a model such as venice-web/deepseek-v4-1-flash-free"
+fi

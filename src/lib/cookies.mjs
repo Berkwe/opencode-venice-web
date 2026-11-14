@@ -24,8 +24,8 @@ import { readCookies } from './sqlite.mjs'
 
 export const BROWSERS = {
   brave: { mac: 'BraveSoftware/Brave-Browser', linux: 'BraveSoftware/Brave-Browser', app: '/Applications/Brave Browser.app', keychain: 'Brave Safe Storage', secret: ['application', 'brave'], label: 'Brave' },
-  chrome: { mac: 'Google/Chrome', linux: 'google-chrome', app: '/Applications/Google Chrome.app', keychain: 'Chrome Safe Storage', secret: ['application', 'chrome'], label: 'Chrome' },
-  edge: { mac: 'Microsoft Edge', linux: 'microsoft-edge', app: '/Applications/Microsoft Edge.app', keychain: 'Microsoft Edge Safe Storage', secret: ['application', 'chrome'], label: 'Edge' },
+  chrome: { mac: 'Google/Chrome', linux: 'google-chrome', app: '/Applications/Google Chrome.app', keychain: 'Chrome Safe Storage', secret: ['application', 'chrome'], altSecrets: [['application', 'chromium']], label: 'Chrome' },
+  edge: { mac: 'Microsoft Edge', linux: 'microsoft-edge', app: '/Applications/Microsoft Edge.app', keychain: 'Microsoft Edge Safe Storage', secret: ['application', 'chrome'], altSecrets: [['application', 'chromium']], label: 'Edge' },
   chromium: { mac: 'Chromium', linux: 'chromium', app: '/Applications/Chromium.app', keychain: 'Chromium Safe Storage', secret: ['application', 'chromium'], label: 'Chromium' },
 }
 
@@ -58,11 +58,13 @@ function passwordFor(browser) {
     return execFileSync('security', ['find-generic-password', '-s', browser.keychain, '-w'], { encoding: 'utf8' }).trim()
   }
   // Linux: secret-tool lookup, fall back to the no-keyring default.
-  try {
-    const value = execFileSync('secret-tool', ['lookup', ...browser.secret], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
-    if (value) return value
-  } catch {
-    /* fall through */
+  for (const attrs of [browser.secret, ...(browser.altSecrets ?? [])]) {
+    try {
+      const value = execFileSync('secret-tool', ['lookup', ...attrs], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+      if (value) return value
+    } catch {
+      /* try the next attribute set */
+    }
   }
   return 'peanuts'
 }
@@ -72,18 +74,10 @@ function decrypt(value, key) {
   const prefix = payload.subarray(0, 3).toString()
   if (prefix === 'v10' || prefix === 'v11') payload = payload.subarray(3)
   const decipher = createDecipheriv('aes-128-cbc', key, Buffer.alloc(16, 0x20))
-  let out = Buffer.concat([decipher.update(payload), decipher.final()])
-  const pad = out[out.length - 1]
-  if (pad >= 1 && pad <= 16) out = out.subarray(0, out.length - pad)
-  // Chromium >= 130 prefixes the plaintext with a SHA256 of the host key.
-  if (out.length > 32) {
-    try {
-      new TextDecoder('utf8', { fatal: true }).decode(out)
-    } catch {
-      out = out.subarray(32)
-    }
-  }
-  return out.toString('utf8')
+  // Chromium >= 130 puts a SHA256 of the host key in front of the plaintext.
+  const out = Buffer.concat([decipher.update(payload), decipher.final()])
+  const body = out.length > 32 ? out.subarray(32) : out
+  return body.toString('utf8')
 }
 
 function browserUserAgent(browser) {
@@ -108,7 +102,8 @@ export function clientFromCookieDb(dbPath, name) {
   if (!browser) throw new Error(`unknown browser: ${name} (expected ${Object.keys(BROWSERS).join(', ')})`)
   if (!existsSync(dbPath)) return null
 
-  const key = pbkdf2Sync(passwordFor(browser), 'saltysalt', 1003, 16, 'sha1')
+  // One PBKDF2 round, exactly what Chromium uses for the v10 cookie key.
+  const key = pbkdf2Sync(passwordFor(browser), 'saltysalt', 1, 16, 'sha1')
   const copy = path.join(mkdtempSync(path.join(tmpdir(), 'venice-cookie-')), 'Cookies')
   copyFileSync(dbPath, copy)
 
