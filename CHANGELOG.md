@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Signing in opens a browser.** `login.mjs` no longer needs a browser that is
+  already signed in: it starts a Chromium-family browser on a throwaway profile,
+  waits until the window is closed, then reads the `__client` cookie out of that
+  profile. `--browser brave --profile Default` still reads an existing profile,
+  `--cookie/--ua` remains for machines without a display. On top of that,
+  `install.sh` no longer dies with a raw `sed`/`Could not read browser cookies`
+  wall of text: it explains the no-display case and how to pass a cookie.
+- **Cookie reading no longer needs the `sqlite3` binary.** A small built-in
+  SQLite reader (schema from `sqlite_master`, B-tree walk, record decoding) takes
+  over when the CLI is missing; `sqlite3` is still used when installed.
+- **`install.sh` points the systemd unit at the right file.** The path expanded
+  to `packaging/ai.opencode.venice-web.service`, but the file ships as
+  `packaging/venice-web.service`, so every systemd install failed with
+  `sed: can not read …` and wrote no unit.
 - **Image input works.** An OpenAI `image_url` part (data: URL, http URL or a
   local path) is uploaded first, then sent twice: once to receive the backend's
   hydration step, once as multipart with the bytes attached. Vision models now

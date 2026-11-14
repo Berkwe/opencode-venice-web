@@ -3,16 +3,22 @@
  * venice-web login - stores the venice.ai web session (Clerk `__client` cookie)
  * in a local session file. Nothing is sent anywhere except venice.ai/Clerk.
  *
- *   node src/login.mjs                                  # auto-detect browser
- *   node src/login.mjs --browser brave --profile Default
+ *   node src/login.mjs                                  # guided: opens a browser, waits for the sign-in
+ *   node src/login.mjs --browser brave --profile Default # read the cookie out of an existing profile
  *   node src/login.mjs --cookie "__client=…" --ua "Mozilla/5.0 …"
  *   node src/login.mjs --print                          # also print the UA to copy
+ *
+ * Guided mode is the default when a display is available and no cookie was
+ * passed: a throwaway browser profile opens venice.ai, the user signs in and
+ * closes the window, and the cookie is read out of that profile. Nothing is
+ * written to the user's own browser profiles.
  */
 import { chmodSync, mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { clerkBase, clerkVersion, sessionFile } from './lib/config.mjs'
 import { findCookies, clientFromString } from './lib/cookies.mjs'
+import { guidedSignIn, isBrowserSupported } from './lib/browser.mjs'
 import { log, warn } from './lib/log.mjs'
 
 const args = process.argv.slice(2)
@@ -26,7 +32,10 @@ const options = {
   profile: flag('profile'),
   cookie: flag('cookie'),
   userAgent: flag('ua'),
+  timeoutMs: Number(flag('timeout', 15 * 60)) * 1000,
 }
+
+const guided = !options.cookie && !options.profile
 
 const requestHeaders = (client, userAgent) => ({
   'user-agent': userAgent,
@@ -62,34 +71,65 @@ async function mint(client, userAgent, sessionId) {
   return { jwt, expires: claims.exp * 1000 }
 }
 
-async function main() {
-  let client = options.cookie ? clientFromString(options.cookie) : null
-  let userAgent = options.userAgent
-  let source = 'manual'
+/** Reads the cookie either from a guided sign-in or from an existing profile. */
+async function collectCookie() {
+  if (options.cookie) return { client: clientFromString(options.cookie), userAgent: options.userAgent, source: 'manual' }
 
-  if (!client) {
-    const found = findCookies({ browser: options.browser, profile: options.profile })
-    client = found.client
-    userAgent ??= found.userAgent
-    source = found.source
+  if (guided) {
+    const found = await guidedSignIn({
+      browser: options.browser,
+      timeoutMs: options.timeoutMs,
+      onTick: (note) => log(note),
+    })
+    try {
+      return { ...found, cleanup: found.cleanup }
+    } finally {
+      /* cleanup runs after the caller is done */
+    }
   }
-  userAgent ??= 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+
+  if (options.browser && !isBrowserSupported(options.browser)) {
+    throw new Error(`unknown browser: ${options.browser}`)
+  }
+  const found = findCookies({ browser: options.browser, profile: options.profile })
+  return { client: found.client, userAgent: options.userAgent ?? found.userAgent, source: found.source }
+}
+
+async function main() {
+  let collected
+  try {
+    collected = await collectCookie()
+  } catch (error) {
+    warn(`login failed: ${error.message}`)
+    warn('fallback: sign in to venice.ai in a browser, then pass --cookie "__client=…" --ua "…"')
+    process.exit(1)
+  }
+
+  const client = collected.client
+  const userAgent =
+    collected.userAgent ??
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+  const source = collected.source
 
   if (args.includes('--print')) log(`User-Agent: ${userAgent}`)
 
-  const { session, email, uid } = await resolveAccount(client, userAgent)
-  const { jwt, expires } = await mint(client, userAgent, session.id)
+  try {
+    const { session, email, uid } = await resolveAccount(client, userAgent)
+    const { jwt, expires } = await mint(client, userAgent, session.id)
 
-  const state = { version: 1, source, userAgent, client, uid, sessionId: session.id, email, access: jwt, expires }
-  mkdirSync(path.dirname(sessionFile), { recursive: true })
-  const tmp = `${sessionFile}.${randomUUID()}.tmp`
-  writeFileSync(tmp, JSON.stringify(state, null, 1), { mode: 0o600 })
-  renameSync(tmp, sessionFile)
-  chmodSync(sessionFile, 0o600)
+    const state = { version: 1, source, userAgent, client, uid, sessionId: session.id, email, access: jwt, expires }
+    mkdirSync(path.dirname(sessionFile), { recursive: true })
+    const tmp = `${sessionFile}.${randomUUID()}.tmp`
+    writeFileSync(tmp, JSON.stringify(state, null, 1), { mode: 0o600 })
+    renameSync(tmp, sessionFile)
+    chmodSync(sessionFile, 0o600)
 
-  log(`signed in as ${email} (via ${source})`)
-  log(`session file: ${sessionFile}`)
-  warn('keep this file private: it contains a live session cookie.')
+    log(`signed in as ${email} (via ${source})`)
+    log(`session file: ${sessionFile}`)
+    warn('keep this file private: it contains a live session cookie.')
+  } finally {
+    collected.cleanup?.()
+  }
 }
 
 main().catch((error) => {

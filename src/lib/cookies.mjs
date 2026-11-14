@@ -10,12 +10,17 @@
  * Linux (secret-tool / gnome-keyring, falling back to the well-known "peanuts"
  * password used when no keyring is available). Anything else can be passed with
  * `--cookie` + `--ua`.
+ *
+ * The store itself is read either through the `sqlite3` binary or, when it is
+ * missing, through the small built-in reader in `sqlite.mjs` - a fresh machine
+ * often has the browser but not the sqlite3 CLI.
  */
 import { execFileSync } from 'node:child_process'
 import { copyFileSync, existsSync, mkdtempSync } from 'node:fs'
 import { createDecipheriv, pbkdf2Sync } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
+import { readCookies } from './sqlite.mjs'
 
 export const BROWSERS = {
   brave: { mac: 'BraveSoftware/Brave-Browser', linux: 'BraveSoftware/Brave-Browser', app: '/Applications/Brave Browser.app', keychain: 'Brave Safe Storage', secret: ['application', 'brave'], label: 'Brave' },
@@ -93,32 +98,38 @@ function browserUserAgent(browser) {
   return 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 }
 
-function readFromBrowser(name, profile) {
+/**
+ * Reads the `__client` cookie out of one cookie database file. Split out from
+ * `readFromBrowser` so the guided sign-in can point it at a throwaway profile
+ * directory instead of the user's own browser profile.
+ */
+export function clientFromCookieDb(dbPath, name) {
   const browser = BROWSERS[name]
-  const db = candidatePaths(browser, profile).find(existsSync)
-  if (!db) return null
+  if (!browser) throw new Error(`unknown browser: ${name} (expected ${Object.keys(BROWSERS).join(', ')})`)
+  if (!existsSync(dbPath)) return null
 
   const key = pbkdf2Sync(passwordFor(browser), 'saltysalt', 1003, 16, 'sha1')
   const copy = path.join(mkdtempSync(path.join(tmpdir(), 'venice-cookie-')), 'Cookies')
-  copyFileSync(db, copy)
+  copyFileSync(dbPath, copy)
 
-  const rows = execFileSync(
-    'sqlite3',
-    [copy, '-json', `select host_key,name,hex(encrypted_value) as hex from cookies where host_key in (${COOKIE_HOSTS.map((h) => `'${h}'`).join(',')})`],
-    { encoding: 'utf8' },
-  )
-  const parsed = rows.trim() ? JSON.parse(rows) : []
+  const rows = readCookies(copy, COOKIE_HOSTS)
   let client = null
-  for (const row of parsed) {
+  for (const row of rows) {
     if (row.name !== '__client') continue
     try {
       client = decrypt(Buffer.from(row.hex, 'hex'), key)
     } catch {
-      /* try the next profile */
+      /* try the next row */
     }
   }
   if (!client) return null
   return { client, userAgent: browserUserAgent(browser), source: browser.label }
+}
+
+function readFromBrowser(name, profile) {
+  const db = candidatePaths(BROWSERS[name], profile).find(existsSync)
+  if (!db) return null
+  return clientFromCookieDb(db, name)
 }
 
 /** Tries the requested browsers (or all of them) in order. */

@@ -188,8 +188,16 @@ fi
 
 if [ "$DO_LOGIN" = "1" ] || [ ! -f "$CONFIG_DIR/session.json" ]; then
   say ""
-  say "signing in - reads the venice.ai cookie out of your browser"
-  node "$INSTALL_DIR/src/login.mjs" || die "sign-in failed: open venice.ai in your browser, then run node $INSTALL_DIR/src/login.mjs"
+  say "signing in - a browser window opens; sign in to venice.ai and close it"
+  if node "$INSTALL_DIR/src/login.mjs"; then
+    :
+  elif [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+    say "no display here, so the sign-in could not open a browser."
+    say "run it from a desktop session, or pass the cookie yourself:"
+    say "  node $INSTALL_DIR/src/login.mjs --cookie "__client=..." --ua "...""
+  else
+    die "sign-in failed: sign in to venice.ai in the browser window, or pass --cookie/--ua"
+  fi
 fi
 
 say ""

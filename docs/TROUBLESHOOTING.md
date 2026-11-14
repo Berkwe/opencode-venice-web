@@ -32,7 +32,7 @@ Symptom: the model says things like *"the tools are not available / Tool not fou
 The session cookie is stale, was rotated by a fresh browser login, or Cloudflare decided to challenge your IP.
 
 ```sh
-node src/login.mjs           # re-read the cookie from the browser
+node src/login.mjs           # sign in again in the window that opens
 launchctl kickstart -k gui/$(id -u)/ai.opencode.venice-web   # macOS: restart the service
 systemctl --user restart ai.opencode.venice-web               # Linux
 ```
@@ -43,12 +43,21 @@ Logging out of venice.ai in the browser invalidates `__client` - sign in again, 
 
 ## `no usable session yet` right after install
 
-Sign in at venice.ai in a supported browser first, then:
+The login command opens a browser window for you, so there is nothing to prepare:
 
 ```sh
-node src/login.mjs --browser brave
-# or, when your browser is not supported:
-# copy the `__client` value (or the whole Cookie header) from a clerk.venice.ai request
+node src/login.mjs                          # opens a browser, waits, then stores the cookie
+node src/login.mjs --browser brave          # same, in a browser of your choice
+```
+
+Sign in to venice.ai in that window and close it - the cookie is read from the
+throwaway profile afterwards, your own profiles are untouched.
+
+When there is no display (a server, a container), read the cookie out of your
+browser instead: copy the `__client` value (or the whole Cookie header) from a
+clerk.venice.ai request and pass it in.
+
+```sh
 node src/login.mjs --cookie "__client=…" --ua "Mozilla/5.0 (…) Chrome/… Safari/537.36"
 ```
 

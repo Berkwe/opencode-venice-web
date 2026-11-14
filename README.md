@@ -46,7 +46,7 @@ Prefer doing it by hand? Three commands:
 
 ```sh
 npm install -g .        # or run everything from the checkout with `node src/...`
-venice-web-login        # reads the cookie from your browser
+venice-web-login        # opens a browser, waits for your sign-in, then stores the cookie
 venice-web-sync --default   # writes the OpenCode provider
 venice-web             # starts the proxy on 127.0.0.1:3456
 ```
@@ -107,9 +107,10 @@ The catalogue lives in [`src/lib/models.mjs`](src/lib/models.mjs); edit it and r
 | Command | What it does |
 | --- | --- |
 | `node src/proxy.mjs` | run the proxy in the foreground |
-| `node src/login.mjs` | (re)read the browser cookie and store the session |
-| `node src/login.mjs --browser brave` | pick a browser explicitly |
-| `node src/login.mjs --cookie "__client=…" --ua "Mozilla/5.0 …"` | manual mode for unsupported browsers |
+| `node src/login.mjs` | guided sign-in: opens a browser, waits for the sign-in, reads the cookie |
+| `node src/login.mjs --browser brave` | pick a browser explicitly for the guided sign-in |
+| `node src/login.mjs --browser brave --profile Default` | skip the window and read an existing profile |
+| `node src/login.mjs --cookie "__client=…" --ua "Mozilla/5.0 …"` | manual mode, e.g. on a machine with no display |
 | `node src/sync.mjs` | add/update the OpenCode provider |
 | `node src/sync.mjs --default` | also set `model` and `small_model` |
 | `node src/sync.mjs --remove` | remove the provider again |

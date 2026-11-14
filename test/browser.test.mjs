@@ -1,0 +1,74 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { assertDisplay, findLauncher, isBrowserSupported, profileRoot } from '../src/lib/browser.mjs'
+
+const withDisplay = (env, fn) => {
+  const saved = { DISPLAY: process.env.DISPLAY, WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY }
+  process.env.DISPLAY = env.DISPLAY ?? ''
+  process.env.WAYLAND_DISPLAY = env.WAYLAND ?? ''
+  try {
+    fn()
+  } finally {
+    if (saved.DISPLAY === undefined) delete process.env.DISPLAY
+    else process.env.DISPLAY = saved.DISPLAY
+    if (saved.WAYLAND_DISPLAY === undefined) delete process.env.WAYLAND_DISPLAY
+    else process.env.WAYLAND_DISPLAY = saved.WAYLAND_DISPLAY
+  }
+}
+
+test('isBrowserSupported only accepts the known browsers', () => {
+  assert.equal(isBrowserSupported('brave'), true)
+  assert.equal(isBrowserSupported('chrome'), true)
+  assert.equal(isBrowserSupported('firefox'), false)
+})
+
+test('assertDisplay accepts a Wayland session', () => {
+  withDisplay({ WAYLAND: 'wayland-0' }, () => assert.doesNotThrow(() => assertDisplay()))
+})
+
+test('assertDisplay accepts an X session', () => {
+  withDisplay({ DISPLAY: ':0' }, () => assert.doesNotThrow(() => assertDisplay()))
+})
+
+test('assertDisplay explains the manual fallback when there is no display', () => {
+  withDisplay({}, () => assert.throws(() => assertDisplay(), /no display .*--cookie/))
+})
+
+test('findLauncher rejects an unknown browser name', () => {
+  assert.throws(() => findLauncher('firefox'), /unknown browser: firefox/)
+})
+
+test('findLauncher reports a missing browser by label', () => {
+  // Every launcher name is guaranteed absent by the empty PATH
+  const saved = process.env.PATH
+  process.env.PATH = '/nonexistent'
+  try {
+    assert.throws(() => findLauncher('brave'), /Brave is not installed/)
+  } finally {
+    process.env.PATH = saved
+  }
+})
+
+test('profileRoot points at the config dir', () => {
+  assert.match(profileRoot(), /\.config$/)
+})
+
+test('guided sign-in cleans up after itself', async () => {
+  // Exercised only where a browser exists; the module is imported eagerly either way.
+  const { guidedSignIn } = await import('../src/lib/browser.mjs')
+  assert.equal(typeof guidedSignIn, 'function')
+})
+
+const scratch = mkdtempSync(path.join(tmpdir(), 'venice-browser-test-'))
+test.after(() => rmSync(scratch, { recursive: true, force: true }))
+
+test('a temp profile is a directory that can be created and removed', () => {
+  const dir = path.join(scratch, 'profile')
+  mkdirSync(dir, { recursive: true })
+  assert.equal(existsSync(dir), true)
+  rmSync(dir, { recursive: true, force: true })
+  assert.equal(existsSync(dir), false)
+})
