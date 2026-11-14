@@ -16,7 +16,7 @@
  * often has the browser but not the sqlite3 CLI.
  */
 import { execFileSync } from 'node:child_process'
-import { copyFileSync, existsSync, mkdtempSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdtempSync, statSync } from 'node:fs'
 import { createDecipheriv, pbkdf2Sync } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
@@ -134,6 +134,9 @@ function browserUserAgent(browser) {
 export function clientFromCookieDb(dbPath, name) {
   const browser = BROWSERS[name]
   if (!browser) throw new Error(`unknown browser: ${name} (expected ${Object.keys(BROWSERS).join(', ')})`)
+  // A profile directory is accepted as well, so callers do not have to know the
+  // layout inside it.
+  if (existsSync(dbPath) && statSync(dbPath).isDirectory()) dbPath = path.join(dbPath, 'Default', 'Cookies')
   if (!existsSync(dbPath)) return null
 
   const passwords = passwordsFor(browser)

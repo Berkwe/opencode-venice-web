@@ -122,7 +122,7 @@ export async function guidedSignIn({ browser, timeoutMs = MAX_WAIT_MS, onTick } 
     spawnError = error
   })
 
-  const deadline = Date.now() + timeoutMs
+  let deadline = Date.now() + timeoutMs
   let seen = null
   let ticks = 0
 
