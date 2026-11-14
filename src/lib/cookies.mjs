@@ -35,6 +35,11 @@ const profiles = (name) => (name ? [name] : ['Default', 'Profile 1', 'Profile 2'
 
 function candidatePaths(browser, profile) {
   const home = homedir()
+  // An absolute path is a profile directory of its own (guided sign-in on a
+  // throwaway profile, or any --profile outside the browser's config dir).
+  if (profile && path.isAbsolute(profile)) {
+    return [path.join(profile, 'Cookies'), `${profile}-Cookies`]
+  }
   if (process.platform === 'darwin') {
     const root = path.join(home, 'Library', 'Application Support', browser.mac)
     return profiles(profile).map((dir) => path.join(root, dir, 'Cookies'))
@@ -46,9 +51,12 @@ function candidatePaths(browser, profile) {
     else dirs.push(path.join(root, browser.linux))
   }
   const out = []
-  for (const dir of dirs) for (const profile of profiles(profile === 'Default' ? undefined : profile)) {
-    out.push(path.join(dir, profile, 'Cookies'))
-    out.push(path.join(dir, `${profile}-Cookies`))
+  // `profiles` shadows the `profile` parameter inside the loop head, so the
+  // requested name is resolved once, before the loop.
+  const dirsForProfile = profiles(profile === 'Default' ? undefined : profile)
+  for (const dir of dirs) for (const dirName of dirsForProfile) {
+    out.push(path.join(dir, dirName, 'Cookies'))
+    out.push(path.join(dir, `${dirName}-Cookies`))
   }
   return out
 }
@@ -67,6 +75,32 @@ function passwordFor(browser) {
     }
   }
   return 'peanuts'
+}
+
+/**
+ * Candidate passwords for a profile, most likely first.
+ *
+ * A guided sign-in runs with `--password-store=basic`, so its cookies are
+ * encrypted with the well-known "peanuts" password even when the desktop
+ * keyring holds an (unrelated) entry for the same browser. Reading a user's own
+ * profile is the other way round, so the keyring value comes first there and
+ * "peanuts" stays as the last resort.
+ */
+function passwordsFor(browser) {
+  const keyring = passwordFor(browser)
+  return keyring === 'peanuts' ? ['peanuts'] : [keyring, 'peanuts']
+}
+
+/** Decrypts one cookie value; `null` when none of the passwords fit. */
+function decryptWith(value, passwords) {
+  for (const password of passwords) {
+    try {
+      return decrypt(value, pbkdf2Sync(password, 'saltysalt', 1, 16, 'sha1'))
+    } catch {
+      /* wrong password for this profile - try the next one */
+    }
+  }
+  return null
 }
 
 function decrypt(value, key) {
@@ -102,8 +136,7 @@ export function clientFromCookieDb(dbPath, name) {
   if (!browser) throw new Error(`unknown browser: ${name} (expected ${Object.keys(BROWSERS).join(', ')})`)
   if (!existsSync(dbPath)) return null
 
-  // One PBKDF2 round, exactly what Chromium uses for the v10 cookie key.
-  const key = pbkdf2Sync(passwordFor(browser), 'saltysalt', 1, 16, 'sha1')
+  const passwords = passwordsFor(browser)
   const copy = path.join(mkdtempSync(path.join(tmpdir(), 'venice-cookie-')), 'Cookies')
   copyFileSync(dbPath, copy)
 
@@ -111,11 +144,8 @@ export function clientFromCookieDb(dbPath, name) {
   let client = null
   for (const row of rows) {
     if (row.name !== '__client') continue
-    try {
-      client = decrypt(Buffer.from(row.hex, 'hex'), key)
-    } catch {
-      /* try the next row */
-    }
+    client = decryptWith(Buffer.from(row.hex, 'hex'), passwords)
+    if (client) break
   }
   if (!client) return null
   return { client, userAgent: browserUserAgent(browser), source: browser.label }
