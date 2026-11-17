@@ -118,7 +118,7 @@ test('toVeniceRequest: hides the Code Mode wrappers when real tools exist', () =
     tools: [tool('read'), tool('execute'), tool('search')],
   })
   // `view_media` rides along: models ask for it whenever an image is in the turn
-  assert.deepEqual([...mapping.toolNames], ['read', 'view_media'])
+  assert.deepEqual([...mapping.toolNames], ['read'])
   assert.equal(mapping.emulatedTools, true)
 })
 
@@ -128,7 +128,7 @@ test('toVeniceRequest: keeps wrappers when they are the only tools', () => {
     messages: [{ role: 'user', content: 'hi' }],
     tools: [tool('execute')],
   })
-  assert.deepEqual([...mapping.toolNames], ['execute', 'view_media'])
+  assert.deepEqual([...mapping.toolNames], ['execute'])
 })
 
 test('toVeniceRequest: appends the format reminder as the last user message', () => {
@@ -648,14 +648,14 @@ test('preferAnswer: with replaceAnswer a real retry answer replaces the first on
 // Models ask for `view_media` as soon as an image is in the turn. It is not in the
 // client's list, so without the extra schema every such call was rejected and the
 // turn went through a retry (measured 5/20 rejected, 0/20 after offering it).
-test('toVeniceRequest: offers view_media so an image turn can ask for it', () => {
+test('toVeniceRequest: does not invent view_media when multipart carries the images', () => {
   const mapping = toVeniceRequest({
     model: Object.keys(MODELS)[0],
     messages: [{ role: 'user', content: 'hi' }],
     tools: [tool('read')],
   })
-  assert.equal(mapping.toolNames.has('view_media'), true)
-  assert.deepEqual(mapping.toolSchemas.get('view_media').required, ['media_ids'])
+  assert.equal(mapping.toolNames.has('view_media'), false)
+  assert.equal(mapping.toolSchemas.has('view_media'), false)
 })
 
 test('toVeniceRequest: does not add view_media twice or without tools', () => {

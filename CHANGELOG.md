@@ -2,52 +2,56 @@
 
 ## Unreleased
 
-- **`install.sh` never leaves you without a session silently.** Without a stored
-  session it now prints the exact sign-in steps (with the real install path) and
-  tells you that `--login` does it right away; with a session it says so and
-  skips the browser. Previously a fresh install just ended and the proxy answered
-  `401` until you found `login.mjs` yourself.
-- **Signing in opens a browser.** `login.mjs` no longer needs a browser that is
-  already signed in: it starts a Chromium-family browser on a throwaway profile,
-  waits until the window is closed, then reads the `__client` cookie out of that
-  profile. `--browser brave --profile Default` still reads an existing profile,
-  `--cookie/--ua` remains for machines without a display. On top of that,
-  `install.sh` no longer dies with a raw `sed`/`Could not read browser cookies`
-  wall of text: it explains the no-display case and how to pass a cookie.
-- **Cookie reading no longer needs the `sqlite3` binary.** A small built-in
-  SQLite reader (schema from `sqlite_master`, B-tree walk, record decoding) takes
-  over when the CLI is missing; `sqlite3` is still used when installed.
-- **`install.sh` points the systemd unit at the right file.** The path expanded
-  to `packaging/ai.opencode.venice-web.service`, but the file ships as
-  `packaging/venice-web.service`, so every systemd install failed with
-  `sed: can not read …` and wrote no unit.
-- **Image input works.** An OpenAI `image_url` part (data: URL, http URL or a
-  local path) is uploaded first, then sent twice: once to receive the backend's
-  hydration step, once as multipart with the bytes attached. Vision models now
-  describe the picture instead of guessing from the text. Old turns keep a text
-  marker so the bytes are not resent every turn. See docs/PROTOCOL.md §5.1;
-  measured 8/8 on two coloured fixtures.
-- **The default model is a catalogue id again.** `DEFAULT_MODEL` still pointed at
-  `deepseek-v4-1-flash-free`, which the 2026-11-10 catalogue refresh removed; the
-  first request of a fresh install would have failed with `unknown model`. It is
-  now `deepseek-v4-1-flash-uncensored`, guarded at import and covered by tests.
-- **Venice's tool loop is cut earlier.** The step counter alone let a stuck turn
-  run to Venice's 10-step cap and give up without an answer; the response is now
-  cut as soon as a native call appears (2nd step), the last retry is watched too,
-  and the reminder says why "Tool not found" showed up.
-- **Text-to-image models are in the pool.** The five free ones from the web
-  catalogue (`z-image-turbo`, `venice-sd35`, `lustify-v8`, `wai-Illustrious`,
-  `chroma`) serve `POST /v1/images/generations` (`{model, prompt, n, size}` to
-  `{data:[{b64_json}]}`). Three of them are NSFW-capable, `wai-Illustrious` is
-  hentai-tuned. `/v1/models` marks them `kind: "image"` and a chat call to one
-  fails with a pointer to the image route. The other 40 image models cost credits.
-  Protocol: docs/PROTOCOL.md §5.2.
-- **Oversized image requests no longer fail.** The endpoint caps a side at 1344
-  px and the pixel count at 1.5M, and answered `400` (502 here) past either - a
-  hard-coded 1536 meant every large request failed. Sizes are now clamped to those
-  limits and to the model's own divisor, so `1536x1536` returns 1224x1224 instead
-  of an error.
+- **Merged sign-in and profile fixes.** Guided browser sign-in, absolute profile
+  paths, the built-in SQLite fallback and installer sign-in instructions remain
+  available alongside the Linux transport and multipart image improvements.
+- **Tool-loop recovery stays guarded.** Native calls are cut early, recovery
+  disables reasoning, completed streams stop immediately, and invalid calls are
+  never dispatched after retries are exhausted. Request IDs correlate chat logs.
+- **The refreshed chat catalogue is retained.** Vision is advertised only for
+  measured model IDs. Image generation uses the agent route; the superseded
+  upload/hydration and direct-image implementations have been removed.
+
+- **Image generation and editing**: `POST /v1/images/generations` and
+  `POST /v1/images/edits` in OpenAI's shape, on the free web models
+  (`z-image-turbo`, `chroma`, `wai-illu`; edits on `firered-image-edit`,
+  `qwen-edit-uncensored`). The prompt is used verbatim, size and model are
+  honoured, `n` runs in parallel, edits take multipart or JSON. Nothing is
+  uploaded or stored. Verified on macOS and Linux. PROTOCOL §5b; the agent route
+  and its events were first mapped by @crisazas in #4.
+
+- **`kimi-k2-5` is gone from the catalogue.** The web catalogue bills it now
+  (`usesCredits: true`), and this proxy only lists free models. Rerun
+  `venice-web-sync` (or the installer); if OpenCode used it as the default model,
+  pick another one.
+
+- **Images.** Attach a screenshot in OpenCode and the model sees it, also on every
+  tool step of the task it starts (an OpenCode run read `4719` off a test picture
+  and wrote it to a file, on macOS and Linux). The bytes travel with the request
+  as multipart; nothing is uploaded or stored. The image has to sit in the last
+  user message or the model reaches for Venice's `view_media`, which the client
+  cannot run (0/5 before, 5/5 after). The sync marks the 19 measured models with
+  image input so OpenCode sends pictures to them. Protocol notes: PROTOCOL §2b;
+  the multipart field names come from @crisazas's work in #4.
+
+- **Linux works end to end.** Measured on Ubuntu 24.04 (Brave 157, curl 8.5.0 /
+  OpenSSL 3.0.13) next to macOS, with the same account:
+  - Sign-in read the cookie with the macOS key derivation (1003 PBKDF2 rounds;
+    Chromium uses 1 on Linux) and, before that, died on a variable shadowing bug
+    (`Cannot access 'profile' before initialization`). Both v10 (no keyring) and
+    v11 (GNOME keyring) cookies now sign in. A cookie that is found but cannot be
+    decrypted is reported as such instead of "no venice.ai cookie".
+  - curl got its headers from `/dev/fd/3`, which Linux cannot open for Node's
+    socket pipes (curl exit 26). They now go through a `0600` file that is
+    removed as soon as curl has read it.
+  - Cloudflare rejects the stock OpenSSL ClientHello (0/5); with `--tlsv1.3` the
+    same request passes (10/10). OpenSSL builds of curl get that flag,
+    `VENICE_WEB_CURL_TLS_ARGS` overrides it, and macOS is unchanged.
+  - The systemd unit template now has the name `install.sh` looks for.
+  Thanks to @crisazas for reporting and diagnosing these (#1, #2, #3).
+
 - `skills/opencode-orchestrator/`: a Claude Code skill that lets Claude plan work,
+  hand small tasks to `opencode run` workers and verify every result itself. The
   scripts close stdin (an open pipe made workers hang before the model was called),
   put a hard time limit on every run, check that the installed `opencode` accepts
   every flag used (an unknown flag exits 0 without running), and nudge the same

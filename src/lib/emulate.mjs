@@ -12,7 +12,7 @@
  *  2. The reply is newline delimited SSE (with `event:`/`data:` frames). We
  *     convert deltas into OpenAI streaming chunks.
  */
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { MODELS } from './models.mjs'
 import { readLenient } from './lenient-json.mjs'
 import { repairJsonControlChars } from './sanitize.mjs'
@@ -29,7 +29,6 @@ import { repairJsonControlChars } from './sanitize.mjs'
  * language.
  */
 export const TOOL_PROMPT = `You are connected to an external agent that executes tools on the user's computer. These tools ARE called directly by name in \`tool_calls\` (not inside \`execute\`); they are NOT Venice server tools.
-Do not use built-in function calling: never emit a native tool call, only the "tool_calls" array of your JSON reply.
 Return ONLY one valid JSON object, without markdown fences and without any text outside JSON, with this exact shape:
 {"content":"text for the user, or an empty string","status":"continue","tool_calls":[{"name":"exact tool name","arguments":{}}]}
 "status" is required and is one of:
@@ -46,6 +45,37 @@ export const REMINDER_FIRST_TURN =
   'Reply with exactly one JSON object and nothing else, with "status". If the task needs files, a command or a search, call those tools in tool_calls now with "status":"continue" - do not answer yet.'
 export const REMINDER_AFTER_TOOL =
   'Reply with exactly one JSON object and nothing else. If more work is needed, call the next tool now with "status":"continue". Only when the whole request is finished answer with "status":"done" and "tool_calls":[]; use "status":"ask" only for a question the user must answer.'
+
+/**
+ * Goes with the images when they are moved past the user's own message (see
+ * `withImagesLast`), so the model knows whose they are and does not look for a
+ * tool to open them.
+ */
+export const IMAGE_NOTE =
+  'The image(s) attached here belong to the user\'s request above and are visible to you now: read them directly. There is no tool for viewing images.'
+
+/**
+ * Moves every `input_image` part to the last user message. Venice shows the
+ * model an image directly only when it sits in the last user message; anywhere
+ * earlier the model has to call Venice's `view_media`, and with emulated tools
+ * that call lands in the envelope where nothing runs it (docs/PROTOCOL.md §2b).
+ * The format and retry reminders are user messages that come after the user's
+ * own, so the images are moved onto them.
+ */
+export function withImagesLast(messages) {
+  const images = messages.flatMap((message) => (Array.isArray(message.content) ? message.content : []).filter((part) => part?.type === 'input_image'))
+  if (!images.length) return messages
+  const lastUser = messages.findLastIndex((message) => message.role === 'user')
+  return messages.map((message, index) => {
+    if (!Array.isArray(message.content)) return message
+    const rest = message.content.filter((part) => part?.type !== 'input_image')
+    if (index !== lastUser) return rest.length === message.content.length ? message : { ...message, content: rest }
+    const ownImages = rest.length !== message.content.length
+    // a reminder that receives the images says whose they are
+    const note = ownImages ? [] : [{ type: 'output_text', text: IMAGE_NOTE, annotations: [] }]
+    return { ...message, content: [...images, ...rest, ...note] }
+  })
+}
 
 /** Sent on a retry when the reply was prose or did not call a tool on a user turn. */
 export const RETRY_REMINDER =
@@ -81,7 +111,7 @@ export const RESULT_REMINDER =
  * the way they were called was wrong.
  */
 export const NATIVE_CALL_REMINDER =
-  'your tools work. You used built-in function calling, which Venice ran itself (hence "Tool not found"). The ONLY way to call a tool is the "tool_calls" array of your JSON reply: ignore that message and send the same tool call now as {"content":"","status":"continue","tool_calls":[{"name":"...","arguments":{...}}]}.'
+  'your tools work. Do not use built-in function calling or any native tool-call syntax: the ONLY way to call a tool is the "tool_calls" array of your JSON reply. Ignore any earlier "Tool not found" message and call the tool you need now in tool_calls with "status":"continue".'
 
 /** A reply cut off because Venice was looping on native tool calls. */
 export function serverLoopMessage() {
@@ -155,20 +185,20 @@ export function shouldRetry({ message, lastRole, available = [] }) {
  * client, so the last resort is the raw text and then a marker. Mutates and
  * returns the message.
  */
-/** Fail closed after retry exhaustion; never dispatch a call already rejected by validation. */
-export function rejectInvalidCalls(message) {
-  if (!message.tool_calls || !message.problems?.length) return message
-  message.content = `Proxy rejected invalid tool calls; no calls from this reply were dispatched: ${message.problems.join('; ')}`
-  message.tool_calls = null
-  message.status = 'done'
-  return message
-}
-
 export function applyFallback(message, rawText) {
   if (!isEmptyAnswer(message)) return message
   message.content = fallbackAnswerText(rawText) || (message.serverLoop
     ? 'Proxy tool-call recovery failed: Venice attempted native tools instead of returning the external tool-call JSON. No external tool call was dispatched for this request. Earlier calls in this conversation may have succeeded.'
     : EMPTY_MARKER)
+  return message
+}
+
+/** Never dispatch calls already rejected by schema validation. */
+export function rejectInvalidCalls(message) {
+  if (!message.tool_calls || !message.problems?.length) return message
+  message.content = `Proxy rejected invalid tool calls; no calls from this reply were dispatched: ${message.problems.join('; ')}`
+  message.tool_calls = null
+  message.status = 'done'
   return message
 }
 
@@ -325,6 +355,60 @@ export function normalizeToolName(name, available) {
  */
 const WRAPPER_TOOLS = new Set(['execute', 'search'])
 
+/** Image types taken from a data URL. The proxy fetches nothing, so remote URLs stay text. */
+const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
+
+/** Images per turn; the web catalogue's `maxImages` is 10 for every model that states one. */
+export const MAX_IMAGES = 10
+
+/** The URL of an OpenAI `image_url` part (`{ url }` or a bare string), or null. */
+function imageUrlOf(part) {
+  if (part?.type !== 'image_url') return null
+  const value = part.image_url
+  return typeof value === 'string' ? value : (value?.url ?? null)
+}
+
+/**
+ * Decodes a base64 image data URL into `{ mediaId, mimeType, data }`, or null
+ * for anything else. Any id works - Venice reads the bytes that travel with the
+ * request (docs/PROTOCOL.md §2b) - so it is derived from the bytes: the same
+ * image keeps its id across a tool loop and a repeat is sent once.
+ */
+export function imageFromDataUrl(url) {
+  const match = /^data:([^;,]+)((?:;[^;,]*)*);base64,(.*)$/s.exec(typeof url === 'string' ? url : '')
+  if (!match) return null
+  return imageFromBytes(match[1], Buffer.from(match[3], 'base64'))
+}
+
+/** `{ mediaId, mimeType, data }` for raw image bytes, or null for an unknown type or no bytes. */
+export function imageFromBytes(type, data) {
+  const mimeType = String(type ?? '').split(';')[0].trim().toLowerCase()
+  if (!IMAGE_TYPES.has(mimeType) || !data?.length) return null
+  const hex = createHash('sha256').update(data).digest('hex')
+  const mediaId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`
+  return { mediaId, mimeType, data }
+}
+
+/**
+ * Splits a user message into the images that travel as bytes and the text that
+ * is left. Images the proxy cannot send (a remote URL, an unknown type, past
+ * `MAX_IMAGES`) stay in the text as `[image]`, like every older turn's do.
+ */
+export function splitImages(content) {
+  if (!Array.isArray(content)) return { images: [], text: textOf(content) }
+  const images = []
+  const rest = []
+  for (const part of content) {
+    const image = images.length < MAX_IMAGES ? imageFromDataUrl(imageUrlOf(part)) : null
+    if (!image) {
+      rest.push(part)
+      continue
+    }
+    if (!images.some((known) => known.mediaId === image.mediaId)) images.push(image)
+  }
+  return { images, text: textOf(rest) }
+}
+
 export function textOf(content) {
   if (typeof content === 'string') return content
   if (content == null) return ''
@@ -334,14 +418,6 @@ export function textOf(content) {
     .filter(Boolean)
     .join('\n')
 }
-
-/** True when a message carries an image part (OpenAI `image_url`). */
-export function hasImages(message) {
-  return Array.isArray(message?.content) && message.content.some((part) => part?.type === 'image_url')
-}
-
-/** A message whose content is only an image (no text) still needs a prompt. */
-export const IMAGE_ONLY_PROMPT = 'Look at the attached image.'
 
 /** OpenAI reasoning_effort -> the web endpoint's three-valued switch. */
 export function reasoningMode(body) {
@@ -362,12 +438,10 @@ function safeJson(value) {
 /**
  * Builds the upstream request.
  *
- * @returns {{ request: object, toolNames: Set<string>, toolSchemas: Map<string, object>, emulatedTools: boolean }}
+ * @returns {{ request: object, toolNames: Set<string>, toolSchemas: Map<string, object>, emulatedTools: boolean, images: {mediaId: string, mimeType: string, data: Buffer}[] }}
  */
 export function toVeniceRequest(body) {
-  if (MODELS[body.model]?.kind === 'image') {
-    throw new Error(`${body.model} is an image model, use /v1/images/generations`)
-  }
+  if (MODELS[body.model]?.kind === 'image') throw new Error(`${body.model} is an image model, use /v1/images/generations`)
   if (!MODELS[body.model]) {
     throw new Error(`unknown model: ${body.model}. Known: ${Object.keys(MODELS).join(', ')}`)
   }
@@ -377,31 +451,6 @@ export function toVeniceRequest(body) {
   const direct = tools.filter((tool) => tool?.function?.name && !WRAPPER_TOOLS.has(tool.function.name))
   if (direct.length) tools = direct
 
-  // Models ask for `view_media` whenever an image is in the turn, but the
-  // client never advertises it: the bytes already ride along as `input_image`
-  // parts, so nothing has to be read back. Left out of the list, every such
-  // call was rejected as "there is no tool named view_media" and the turn went
-  // through a retry (measured 5/20 with an image in the turn, 0/20 once the
-  // name was offered). The schema is only there to make the call valid; the
-  // call itself is answered by the proxy and never reaches the client.
-  if (tools.length && !tools.some((tool) => tool?.function?.name === 'view_media')) {
-    tools = [
-      ...tools,
-      {
-        type: 'function',
-        function: {
-          name: 'view_media',
-          description: 'Read an image that is attached to the conversation.',
-          parameters: {
-            type: 'object',
-            properties: { media_ids: { type: 'array', items: { type: 'string' } } },
-            required: ['media_ids'],
-          },
-        },
-      },
-    ]
-  }
-
   const names = new Set()
   for (const tool of tools) {
     if (tool?.type !== 'function' || !tool.function?.name) throw new Error('only function tools are supported')
@@ -410,21 +459,23 @@ export function toVeniceRequest(body) {
 
   const instructions = []
   const messages = []
+  // Only the newest user message carries its images as images: in a tool loop
+  // that is the message that asked for the work, so the picture stays visible
+  // on every step, and an older picture is not resent once the user moves on.
+  const newestUser = body.messages.findLastIndex((message) => message?.role === 'user')
+  let images = []
 
-  for (const message of body.messages) {
-    const text = textOf(message.content)
+  for (const [index, message] of body.messages.entries()) {
+    let text = textOf(message.content)
+    if (index === newestUser) ({ images, text } = splitImages(message.content))
     if (message.role === 'system' || message.role === 'developer') {
       instructions.push(text)
       continue
     }
     if (!['user', 'assistant', 'tool'].includes(message.role)) continue
 
-    // Image parts are uploaded separately (`media.mjs`) and re-attached as
-    // `input_image` parts on the last user turn only; older turns keep the
-    // `[image]` marker so the bytes are not sent on every request.
-    const images = message.role === 'user' && hasImages(message)
     let role = message.role
-    let content = images && !text ? IMAGE_ONLY_PROMPT : text
+    let content = text
 
     if (message.role === 'tool') {
       // Tool results travel as a user message in the agent's own envelope shape.
@@ -450,16 +501,14 @@ export function toVeniceRequest(body) {
     }
 
     const parts = [{ type: 'output_text', text: content, annotations: [] }]
-    // the OpenAI parts travel along: `media.mjs` uploads them and swaps them for
-    // `input_image` parts on the request this message belongs to
-    if (images) parts.push(...message.content.filter((part) => part?.type === 'image_url'))
+    // the image parts go first, the order the web client uses
+    if (index === newestUser) parts.unshift(...images.map((image) => ({ type: 'input_image', media_id: image.mediaId, detail: 'auto' })))
     messages.push({
       id: randomUUID(),
       type: 'message',
       status: 'completed',
       role,
       content: parts,
-      ...(images ? { needsImages: true } : {}),
     })
   }
 
@@ -481,7 +530,8 @@ export function toVeniceRequest(body) {
       `${TOOL_PROMPT}\nTool choice: ${JSON.stringify(choice)}.\nAvailable tools:\n${JSON.stringify(tools.map((tool) => tool.function))}`,
     )
     const last = messages[messages.length - 1]
-    const afterToolResult = typeof last?.content?.[0]?.text === 'string' && last.content[0].text.startsWith('{"tool_result"')
+    const lastText = last?.content?.find((part) => part.type === 'output_text')?.text
+    const afterToolResult = typeof lastText === 'string' && lastText.startsWith('{"tool_result"')
     const reminder = last?.role === 'user' && afterToolResult ? REMINDER_AFTER_TOOL : REMINDER_FIRST_TURN
     messages.push({
       id: randomUUID(),
@@ -496,7 +546,7 @@ export function toVeniceRequest(body) {
     request: {
       modelId: body.model,
       systemPrompt: { instructions: instructions.filter(Boolean).join('\n\n') },
-      messages,
+      messages: withImagesLast(messages),
       tools: [],
       clientTools: [],
       ...reasoningMode(body),
@@ -504,20 +554,9 @@ export function toVeniceRequest(body) {
     toolNames: names,
     toolSchemas: new Map(tools.map((tool) => [tool.function.name, tool.function.parameters ?? {}])),
     emulatedTools: tools.length > 0,
+    // bytes for the `input_image` parts above; they travel as multipart fields
+    images,
   }
-}
-
-/**
- * Returns the translated messages of the turn that still has to get its image
- * parts, so they can be uploaded (`media.mjs`). Those are the same objects the
- * request carries: `attachImages` rewrites their content in place, which is how
- * the `input_image` parts reach the request. The `needsImages` marker is dropped
- * on the way, it only tells this path that the turn has images at all.
- */
-export function imageMessages(request) {
-  const marked = request.messages.filter((message) => message.needsImages)
-  for (const message of marked) delete message.needsImages
-  return marked
 }
 
 /**
@@ -530,10 +569,9 @@ export function imageMessages(request) {
 export function withRetryReminder(request, reminder = RETRY_REMINDER) {
   return {
     ...request,
-    // Native tool routing can persist during reasoning despite the JSON prompt.
-    // Only recovery attempts disable reasoning; the original request is untouched.
+    // Disable reasoning only when recovering from native tool routing.
     ...(reminder === NATIVE_CALL_REMINDER ? { reasoningMode: 'disabled' } : {}),
-    messages: [
+    messages: withImagesLast([
       ...request.messages,
       {
         id: randomUUID(),
@@ -542,7 +580,7 @@ export function withRetryReminder(request, reminder = RETRY_REMINDER) {
         role: 'user',
         content: [{ type: 'output_text', text: `(act reminder) ${reminder}`, annotations: [] }],
       },
-    ],
+    ]),
   }
 }
 

@@ -32,7 +32,22 @@ browser cookie jar                     your machine                Venice
   | `curl --http1.1` with the user agent as a plain `-H` line (lands after `Accept`) | 403 html |
   | `curl --http1.1 -A <browser UA>`, default `Accept: */*` | **200 SSE** |
 
-  So: HTTP/1.1, the user agent via `-A`, no `accept: text/event-stream` (the backend streams SSE without it), one short-lived curl process per request. Headers go over fd 3 so the bearer token never shows up in `ps`. Clerk calls still use Node's fetch. `VENICE_WEB_TRANSPORT=fetch|curl` overrides the default `auto` (curl when installed).
+  So: HTTP/1.1, the user agent via `-A`, no `accept: text/event-stream` (the backend streams SSE without it), one short-lived curl process per request. Clerk calls still use Node's fetch. `VENICE_WEB_TRANSPORT=fetch|curl` overrides the default `auto` (curl when installed).
+
+  **Linux** (measured 2026-11-16, Ubuntu 24.04 in a VM that shares the public IP of a Mac whose curl passes, same session):
+
+  | client | result |
+  | --- | --- |
+  | macOS curl 8.7.1 (LibreSSL / SecureTransport) | 5/5 **200 SSE** |
+  | Ubuntu curl 8.5.0 / OpenSSL 3.0.13, defaults | 0/5 403 html |
+  | same, `--curves X25519:prime256v1:secp384r1` | 0/5 403 html |
+  | same, `--tlsv1.3` | 5/5, then 10/10 **200 SSE** |
+  | same, `--tls-max 1.2` / Chrome cipher list / `--no-alpn` | 5/5 200 SSE each |
+  | macOS curl with `--tlsv1.3` | exit 4 (not built in) |
+
+  Cloudflare rejects the stock OpenSSL ClientHello and nothing else about the request, so `tlsArgsFor()` adds `--tlsv1.3` when `curl --version` names OpenSSL as the backend in use and adds nothing otherwise. `VENICE_WEB_CURL_TLS_ARGS` replaces that choice (space separated, empty for none) in case the rule moves. A TLS-impersonating npm client (`wreq-js`) was proposed for this and is not needed.
+
+  Headers never go on the command line, where `ps` would show the bearer token: they are written to a `0600` file in a fresh `0700` directory just before curl starts (`-H @file`) and removed once the response head arrives. The file holds nothing `session.json` does not already store with the same mode. They used to go over `/dev/fd/3`, which works on macOS only: Node's extra stdio pipes are sockets, Linux cannot reopen a socket through `/proc/self/fd/N`, and curl exited with code 26 before sending anything.
 * If a request still gets challenged, the proxy raises a `SignInError` which surfaces as **HTTP 401** with a "refresh the cookies" message.
 
 Session discovery (`GET /v1/client`) yields the active session id and account. It picks the session matching the stored `uid` when several exist.
@@ -72,6 +87,28 @@ Notes:
 * `tools` and `clientTools` are what the web *agent* uses. Sending `tools: []` does not disable Venice's built-in server tools - the model may still call `view_media`/`get_attachment`.
 * The endpoint ignores `temperature`, `top_p` and `max_tokens`.
 * Requests with `attestationToken` minted are required for `/api/inference/*`; the mint call needs the same headers (sans attestation).
+
+## 2b. Images
+
+Measured 2026-11-16 on the ad-hoc route with a 768x512 test picture (a red circle and the number `4719`).
+
+A user message part `{ "type": "input_image", "media_id": "<id>", "detail": "auto" }` refers to an image. What the web client does: upload the file to `POST /api/v2/agents/media` (multipart `file`, answers `{ mediaId }`), send the turn with the id, and when Venice answers with a `function_call` named `hydrate_content` (`media_ids`, `signature`, `pending_tool_calls`, `current_iteration`), send the turn again as **multipart**: the JSON body in a `request` field and each image in a `media.<media_id>` field, plus the `hydrate_content` call, its `function_call_output` (`{ "items": { "<id>": { "type": "image", "mime_type": … } } }`) and `ok` for every pending call. (Field names and the hydration flow were worked out by @crisazas in #4.)
+
+Measured shortcuts:
+
+| request | result |
+| --- | --- |
+| JSON body, uploaded id | `hydrate_content` with a pending `view_media`; answered once, then "4719, red" |
+| multipart with the bytes, uploaded id, no hydration messages | answer in one round trip |
+| multipart with the bytes, **an id that was never uploaded** | answer in one round trip (2/2) |
+
+So the proxy uploads nothing. Each image of the user's latest message gets an id derived from its bytes, the request goes out as multipart with the bytes in `media.<id>`, and Venice reads them straight from the request: no upload endpoint (which rate-limits with `429`), no id cache, nothing stored on disk. `upstreamChat(…, files)` builds the multipart body with `multipartBody()` (the encoder `fetch()` uses), so it travels through curl like any other body.
+
+Every model in `src/lib/models.mjs` answered "4719" and "red", including the ones the catalogue does not flag `supportsMultiModal`. PNG, a 2.5 MB 3000x2000 PNG, and two images in one message (both read) work too.
+
+**The image has to be in the last user message.** Venice shows the model an image directly only when it sits in the last user message; anywhere earlier the model calls Venice's own `view_media` to look at it (2/2, both answered after that server call). With emulated tools that call is written into the envelope, where nothing runs it: 5 of 5 image questions ended in an invalid `view_media` call and then an unrelated `bash`. The format and retry reminders are user messages that come after the user's own, so `withImagesLast()` moves the image parts onto the last user message with a line saying whose they are. After that: 5/5 answered with tools on, 0 `view_media` calls, and in a tool loop the model still sees the picture (`write code.txt "4719"` after a tool result), on macOS and Linux, through the proxy and through real `opencode run -f`.
+
+Only the latest user message's images are sent. In a tool loop that is the message that started the work, so the picture stays visible on every step; after the user's next message it is history and stays `[image]`.
 
 ## 3. Inference response
 
@@ -221,7 +258,6 @@ OpenAI → Venice:
 | `tool` message | `user` message with `{"tool_result": {…}}` |
 | `reasoning_effort` | `reasoningMode`: `none|minimal|disabled` → `disabled`, `medium|auto|adaptive` → `adaptive`, else `enabled` |
 | `tools` | prompt text (see §4) |
-| `image_url` part | upload to `/api/v2/agents/media`, then an `input_image` part + multipart resubmission (see §5.1) |
 | `stream` | response framing (upstream is always a stream) |
 
 Venice → OpenAI:
@@ -235,93 +271,45 @@ Venice → OpenAI:
 
 Usage is estimated (`countTokens` ≈ characters/4) because the web endpoint reports none.
 
-## 5.1 Image input
+## 5b. Image generation and editing
 
-Images never travel inline in the JSON body. Three parts are involved and only
-all three together make the model see the picture (measured 2026-11-10):
+Measured 2026-11-16, macOS and Linux, through `POST /v1/images/generations` and `/v1/images/edits`.
 
-1. `POST /api/v2/agents/media`, multipart, one `file` field. Answers
-   `{"mediaId": "…"}`. 25 MB cap, `image/png|jpeg|gif|webp`.
-2. Send the message with an `input_image` part (`media_id`, `mime_type`,
-   `detail: "auto"`). The stream produces no text; it emits a tool step whose
-   arguments carry `media_ids`.
-3. Resubmit the whole conversation as `multipart/form-data`: a `request` text
-   field holding the JSON body, plus one **file field named exactly after each
-   `mediaId`**. Only now does `response.output_text.delta` appear.
-
-| Variant | Text? |
-| --- | --- |
-| `input_image` with an unknown id | no |
-| upload + `input_image`, JSON body | no (tool step only) |
-| + `mediaManifest` (`materialized` true/false, with/without `url`) | no |
-| + a `contentHydration` request field | no |
-| `function_call`/`function_call_output` in the body, still JSON | no |
-| **multipart `request` + file field per `mediaId`, via curl** | **yes** |
-| same multipart via Node `fetch` | 403 Cloudflare HTML |
-
-Notes measured on the way:
-
-* The tool step is named `hydrate_content` while the model has written nothing.
-  When it wrote text first, the same step arrives as a **failed `view_media`
-  call** instead. Both are answered identically, with a `function_call_output`
-  naming every `mediaId` under `items`.
-* `function_call_output.output` is `{"items":{"<mediaId>":{"media_id":"<mediaId>"}}}`;
-  the `function_call` reuses the upstream `call_id`.
-* `previousResponseId`/`previousOutputIndex` from the hydration response are
-  optional in the resubmission (works without them).
-* File field name = the `mediaId`, not `file`. The multipart call must not send
-  `content-type: application/json`; with it the backend answers
-  `Invalid JSON request`.
-* Only the newest user turn is uploaded and hydrated; older turns keep a text
-  marker so the bytes are not resent every turn.
-
-## 5.2 Image generation
+The web app makes pictures with Venice's own agent, not the ad-hoc route:
 
 ```
-POST https://outerface.venice.ai/api/inference/image
-{
-  "model": "z-image-turbo", "prompt": "…",
-  "width": 512, "height": 512, "format": "png",
-  "seed": 12345, "requestId": "<uuid>",
-  "hideWatermark": false, "matureFilter": false
-}
+POST /api/inference/chat/agents/venice?paidImagesMode=block
+{ "input": { "messages": [ { …one user message… } ] }, "clientTools": [] }
 ```
 
-The reply is **raw bytes** (`image/png`, no JSON envelope) - the catalogue marks
-these models `supportsBinaryResponse: true`. `seed`, `requestId`,
-`hideWatermark` and `matureFilter` are all required (`400 Invalid request`
-otherwise). Same route, same Cloudflare rules as §2: HTTP/1.1 through curl, no
-`accept: text/event-stream`.
+The agent calls its server tool `generate_image` (`{"requests":[{"prompt","resource_id","width","height","seed"?}]}`) or `edit_image` (`{"requests":[{"prompt","media_ids","resource_id"}]}`) and the bytes stream back in the same response. `paidImagesMode=block` keeps it on free models. Events, in order: `response.output_item.added` with a `veniceai:image_generation` item whose `requests[]` carry the `model_id`, `prompt` and `dimensions` really used; `response.content_part.added` (`veniceai:output_image`, `format`); `veniceai:image_generation.image_chunk` (`item_id`, `content_index`, `chunk_index`, `image_chunk_b64`); `response.content_part.done` (final `dimensions`, `is_blurred`, `is_content_violation`); `veniceai:image_generation.done`; then the server call, its output and a short message. `imageCollector()` reads them.
 
-| Variant | Result |
+What was measured:
+
+| question | result |
 | --- | --- |
-| `modelId` in the body | 400 `modelNotFound` |
-| `model` = catalogue id `stable-diffusion-3.5-rev2` / `wai-illu` | 200, but the **default model's** picture comes back - no error |
-| `model` = `apiModelId` (`venice-sd35`, `wai-Illustrious`) | 200 from that model |
-| `/api/v1/image/generate` with a Bearer token | 401 `Authentication failed` |
-| same seed twice | different bytes; the seed only makes runs comparable |
-| `width`/`height` above 1344, or a pixel count above 1,500,000 | 400 `Number must be less than or equal to 1344` / `Total pixel count … must not exceed 1,500,000` |
+| prompt in plain words | the agent rewrites it, picks the size, chats afterwards |
+| "Call generate_image once … exactly this prompt, unchanged … Model (resource_id): X. Width W, height H." | prompt used verbatim, model and size honoured, reply "Done." |
+| sizes | clamped by the model with the aspect kept: 1792x1024 → 1344x768; chroma 512x512 → 768x768 |
+| free models in the catalogue | `z-image-turbo`, `chroma`, `wai-illu` run. `stable-diffusion-3.5-rev2`, `lustify-sdxl`, `lustify-v8` are refused by the tool ("isn't available") and the agent silently switches to another model, so they are not offered |
+| two requests in one tool call, different seeds | two **identical** pictures (0 % of pixels differ) |
+| one call per picture, each with its own seed | `chroma`: different pictures (84.8 %, 73.5 %); `z-image-turbo`, `wai-illu`: identical, the seed has no effect there |
+| edit: reference as `input_image` with its bytes in the multipart request, never uploaded | works in one round trip, no `hydrate_content` (as for chat, §2b); `firered-image-edit` and `qwen-edit-uncensored` both honoured |
+| edit `n=2` as two calls | two variants (12.2 %, 5.5 % of pixels differ) |
+| time | 4-8 s per generation, 7-15 s per edit; `n` calls run in parallel |
 
-The endpoint resolves models by `apiModelId`, which differs from the catalogue
-id for two models, so `models.mjs` stores the `apiModelId` and the catalogue name
-verbatim. Which models are allowed is decided elsewhere (§6); the proxy exposes
-`POST /v1/images/generations` on top of this (`src/lib/image.mjs`). Sizes are
-clamped to 1344 per side and to the 1.5M pixel budget before sending (to the
-model's `widthHeightDivisor`), so an oversized request is answered with a smaller
-picture rather than a 502.
+So the proxy sends one agent call per requested image, in parallel, with a seed each when `n > 1`. `mask` is refused (the edit tool has no mask; describe the change in the prompt). `response_format: url` is answered with a data URL, since the proxy hosts no files. OpenAI model names (`dall-e-3`, `gpt-image-1`, …) map to the default model; any other unknown name is a 400.
 
 ## 6. Free-model catalogue
 
+The merge retains the expanded 2026-11-10 chat catalogue and its valid default
+`deepseek-v4-1-flash-uncensored`. Vision flags are copied only for exact IDs
+measured in §2b; they are not inferred for renamed or newly added models.
+Generation models are kept separate from chat IDs and use the agent resource IDs
+in §5b. The older upload/hydration and direct binary generation paths are no
+longer used.
+
 `src/lib/models.mjs` mirrors the web catalogue entries flagged `usesCredits: false`. The web app fetches that list from `GET /api/app/models` and `GET /api/v2/agents/configuration_options` with the same session; both are useful if you want to regenerate the list automatically (the proxy currently ships a static copy so it works offline and with a dead session).
-
-The same flag decides the five free text-to-image models of §5.2; the other 40
-image models cost credits and stay out.
-
-## 6.1 Rate and capacity
-
-`z-image-turbo` and `chroma` intermittently answer `503 {"error":"modelAtCapacity"}`
-when several requests arrive together (`n: 2` did it twice in a row, sequential
-calls recovered at once). Treat 503 as transient.
 
 ## 7. Version pins
 

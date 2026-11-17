@@ -11,7 +11,7 @@
  * are the web catalogue limits, used to build the OpenCode model config.
  *
  * `kind: 'image'` marks the text-to-image models: they are served by
- * `/v1/images/generations` (`src/lib/image.mjs`), not by the chat route. Taken
+ * `/v1/images/generations` (`src/lib/imagegen.mjs`), not by the chat route. Taken
  * from the same catalogue run, only the `usesCredits: false` entries.
  */
 export const MODELS = {
@@ -45,16 +45,10 @@ export const MODELS = {
   'e2ee-qwen3-8-27b': { name: 'Qwen 3.8 27B', context: 262144, output: 8192, reasoning: true },
   'zai-org-glm-4.6': { name: 'GLM 4.6', context: 198000, output: 16384, reasoning: false },
   'gemma4-uncensored': { name: 'Gemma 4 Uncensored', context: 256000, output: 8192, reasoning: false },
-  // Text-to-image. The catalogue ids are `stable-diffusion-3.5-rev2` and
-  // `wai-illu`, but the image endpoint only knows their `apiModelId`
-  // (`venice-sd35`, `wai-Illustrious`); the short ids fall back to the default
-  // model without an error, so the `apiModelId` is used. `nsfw`/`hentai` follow
-  // the catalogue's `apiUncensored`/hentai flags, `promptLimit` and
-  // `widthHeightDivisor` are its per-model limits.
+  // Only free models honoured by the agent's generate_image tool. Use catalogue
+  // resource IDs, not the apiModelId aliases of the superseded direct route.
   'z-image-turbo': { name: 'Z-Image Turbo', kind: 'image', promptLimit: 7500, divisor: 8, steps: 8 },
-  'venice-sd35': { name: 'Venice SD35', kind: 'image', promptLimit: 1500, divisor: 16, steps: 25 },
-  'lustify-v8': { name: 'Lustify v8', kind: 'image', nsfw: true, promptLimit: 1500, divisor: 8, steps: 30 },
-  'wai-Illustrious': { name: 'Anime (WAI)', kind: 'image', nsfw: true, hentai: true, promptLimit: 1500, divisor: 16, steps: 25 },
+  'wai-illu': { name: 'Anime (WAI)', kind: 'image', nsfw: true, hentai: true, promptLimit: 1500, divisor: 16, steps: 25 },
   'chroma': { name: 'Chroma', kind: 'image', nsfw: true, promptLimit: 7500, divisor: 8, steps: 10 },
 }
 
@@ -71,6 +65,24 @@ export const DEFAULT_IMAGE_MODEL = 'z-image-turbo'
 export const modelIds = Object.keys(MODELS).filter((id) => MODELS[id].kind !== 'image')
 
 export const imageModelIds = Object.keys(MODELS).filter((id) => MODELS[id].kind === 'image')
+
+/** Only models the free agent route actually honours. */
+export const IMAGE_MODELS = Object.fromEntries(imageModelIds.map((id) => [id, MODELS[id]]))
+export const EDIT_MODELS = {
+  'firered-image-edit': { name: 'FireRed' },
+  'qwen-edit-uncensored': { name: 'Qwen Edit Uncensored' },
+}
+export const DEFAULT_EDIT_MODEL = 'firered-image-edit'
+
+// Preserve the refreshed catalogue; advertise vision only where measured.
+for (const id of [
+  'qwen-3-8-27b', 'qwen3-6-27b', 'qwen3-5-35b-a3b', 'zai-org-glm-5.2',
+  'zai-org-glm-4.6', 'venice-uncensored-1-2', 'google-gemma-4-31b-it',
+  'google-gemma-4-26b-a4b-it', 'gemma4-uncensored', 'aion-labs-aion-3-0',
+  'aion-labs-aion-3-0-mini', 'deepseek-ai-DeepSeek-V3.2', 'e2ee-qwen3-8-27b',
+  'e2ee-gpt-oss-120b-p', 'e2ee-qwen3-6-35b-a3b', 'e2ee-gemma-4-26b-a4b-uncensored-p',
+  'e2ee-qwen-2-5-7b-p', 'e2ee-qwen3-vl-30b-a3b-p',
+]) MODELS[id].vision = true
 
 // A catalogue refresh can drop the default id; fail at import instead of on the
 // first request (`unknown model` in toVeniceRequest).

@@ -173,7 +173,7 @@ if [ "$SERVICE" = "1" ]; then
     sed -e "s|__NODE__|$NODE_BIN|g" \
         -e "s|__PROXY__|$INSTALL_DIR/src/proxy.mjs|g" \
         -e "s|__LOG__|$CONFIG_DIR/proxy.log|g" \
-        "$INSTALL_DIR/packaging/venice-web.service" > "$UNIT"
+        "$INSTALL_DIR/packaging/ai.opencode.venice-web.service" > "$UNIT"
     systemctl --user daemon-reload
     start_service || say "start it with: systemctl --user start $LABEL"
     say "background service installed ($LABEL)"

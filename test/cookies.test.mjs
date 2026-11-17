@@ -35,8 +35,7 @@ test('a profile directory is accepted and resolved to Default/Cookies', () => {
   cookieDb(dir, { value: 'v10not-really-encrypted' })
   // The value is not decryptable, so the interesting part is that the file was
   // found at all (EISDIR before this fix).
-  assert.equal(clientFromCookieDb(dir, 'chromium'), null)
-  assert.doesNotThrow(() => clientFromCookieDb(dir, 'chromium'))
+  assert.throws(() => clientFromCookieDb(dir, 'chromium'), /found the venice.ai cookie but could not decrypt it/)
 })
 
 test('an absolute profile path is used as the profile itself', () => {
@@ -44,5 +43,7 @@ test('an absolute profile path is used as the profile itself', () => {
   cookieDb(dir)
   const db = path.join(dir, 'Default', 'Cookies')
   // Same database through the explicit file path and through the directory.
-  assert.equal(clientFromCookieDb(db, 'chromium'), clientFromCookieDb(dir, 'chromium'))
+  for (const target of [db, dir]) {
+    assert.throws(() => clientFromCookieDb(target, 'chromium'), /found the venice.ai cookie but could not decrypt it/)
+  }
 })

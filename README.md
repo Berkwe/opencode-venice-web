@@ -14,8 +14,9 @@ OpenCode ──HTTP──> 127.0.0.1:3456  ──HTTPS + your session cookie─�
 ```
 
 - No API key, no credits, no password stored: only the browser's long-lived Clerk `__client` cookie.
-- 20 free web models (DeepSeek, Qwen, GLM, Kimi, Gemma, Aion, TEE-hosted variants).
+- 19 free web models (DeepSeek, Qwen, GLM, Gemma, Aion, TEE-hosted variants).
 - Tool calling works: OpenCode's `read`/`write`/`edit`/`shell`/`glob`/`grep` tools are emulated through a JSON envelope (see [docs/PROTOCOL.md](docs/PROTOCOL.md)).
+- Images work: attach a screenshot in OpenCode and the model sees it, also while it works through tool calls.
 - Zero runtime dependencies. Node 22+ and the system `curl` (preinstalled on macOS and most Linux distributions).
 
 ---
@@ -92,15 +93,42 @@ Only models the web catalogue marks as free (`usesCredits: false`) are exposed -
 | DeepSeek | `deepseek-v4-1-flash-free`, `deepseek-ai-DeepSeek-V3.2` |
 | Qwen | `qwen-3-8-27b`, `qwen3-6-27b`, `qwen3-5-35b-a3b` |
 | GLM | `zai-org-glm-5.2`, `zai-org-glm-4.6` |
-| Kimi | `kimi-k2-5` |
 | Gemma | `google-gemma-4-31b-it`, `google-gemma-4-26b-a4b-it`, `gemma4-uncensored` |
 | Venice | `venice-uncensored-1-2` |
 | Aion | `aion-labs-aion-3-0`, `aion-labs-aion-3-0-mini` |
 | TEE / E2EE hosted | `e2ee-qwen3-8-27b`, `e2ee-gpt-oss-120b-p`, `e2ee-qwen3-6-35b-a3b`, `e2ee-gemma-4-26b-a4b-uncensored-p`, `e2ee-qwen-2-5-7b-p`, `e2ee-qwen3-vl-30b-a3b-p` |
 
+All of them take images: each one read a test picture correctly through this proxy, so the sync marks them with image input and OpenCode lets you attach pictures. Rerun `venice-web-sync` after updating if OpenCode says a model does not support images.
+
 The catalogue lives in [`src/lib/models.mjs`](src/lib/models.mjs); edit it and rerun `venice-web-sync` if Venice adds models. If the web catalogue ships a model you want, run `GET /v1/models` (or `venice-web-doctor`) after adding it to verify it is reachable.
 
 ---
+
+## Image generation and editing
+
+The proxy also answers OpenAI's image routes with the free web image models:
+
+```sh
+# generate (default model z-image-turbo; size and n are optional)
+curl -s 127.0.0.1:3456/v1/images/generations -H 'content-type: application/json' \
+  -d '{"prompt":"a red bicycle against a blue wall","size":"1024x1024"}' \
+  | python3 -c 'import sys,json,base64; open("out.png","wb").write(base64.b64decode(json.load(sys.stdin)["data"][0]["b64_json"]))'
+
+# edit (multipart, like the OpenAI SDK sends it)
+curl -s 127.0.0.1:3456/v1/images/edits -F image=@photo.png -F 'prompt=make the sky stormy'
+```
+
+| | models |
+| --- | --- |
+| generate | `z-image-turbo` (default), `chroma`, `wai-illu` (anime) |
+| edit | `firered-image-edit` (default), `qwen-edit-uncensored` |
+
+- The prompt is used as written; the answer's `revised_prompt` is what the model actually got.
+- Sizes from 256 to 2048 per side are accepted. Each model rounds to its own resolution and keeps the aspect ratio (`1792x1024` comes back as 1344x768).
+- `n` up to 4 runs that many generations in parallel. Only `chroma` gives a different picture each time; `z-image-turbo` and `wai-illu` return the same picture for the same prompt.
+- Edits take PNG, JPEG, WebP or GIF as a file or a base64 data URL; image URLs are not downloaded. `mask` is not supported: describe the change in the prompt.
+- `response_format: "url"` returns a `data:` URL, because the proxy stores nothing.
+- OpenAI model names (`dall-e-3`, `gpt-image-1`) get the default model.
 
 ## Commands
 
@@ -138,6 +166,7 @@ All environment variables are optional; the defaults are what the installer uses
 | `VENICE_WEB_DUMP` | off | dump the last translated upstream request |
 | `VENICE_WEB_TRANSPORT` | `auto` | client for the inference host: `auto` (curl when installed), `curl`, `fetch` |
 | `VENICE_WEB_CURL` | `curl` | curl binary to use |
+| `VENICE_WEB_CURL_TLS_ARGS` | auto | extra TLS flags for curl, space separated; auto is `--tlsv1.3` for an OpenSSL build (Linux) and nothing otherwise, empty sends none |
 | `VENICE_WEB_TIMEOUT` | `900000` | per-request upstream timeout (ms) |
 | `VENICE_WEB_JUDGE` | on | `0` turns off the judge that checks whether a turn may end |
 | `VENICE_WEB_JUDGE_MODEL` | `qwen3-5-35b-a3b` | model for the judge (empty: the request's own model) |
@@ -151,7 +180,7 @@ All environment variables are optional; the defaults are what the installer uses
 ## Security and privacy
 
 - The session file (`~/.config/opencode/venice-web/session.json`, mode `600`) holds your Clerk cookie - treat it like a login token, keep it out of git.
-- Only `clerk.venice.ai` and `outerface.venice.ai` are contacted (inference through the system `curl`; its headers go over a pipe, so the token never appears in the process list); the proxy is bound to loopback by default. Anything that can reach it can use your Venice account, so do not expose the port publicly without thinking about it.
+- Only `clerk.venice.ai` and `outerface.venice.ai` are contacted (inference through the system `curl`; its headers go through a private `0600` file that is deleted as soon as curl has read it, so the token never appears in the process list); the proxy is bound to loopback by default. Anything that can reach it can use your Venice account, so do not expose the port publicly without thinking about it.
 - No password is stored (unlike password-based proxies). Logging out of venice.ai in the browser invalidates the cookie; `/out` from the browser plus a fresh login fixes it.
 - Requests leave your machine exactly as the web app would send them: same user agent, same headers, no extra telemetry.
 
@@ -163,7 +192,8 @@ All environment variables are optional; the defaults are what the installer uses
 - **Tool calls are emulated.** The web endpoint ignores OpenAI `tools`, so the model answers with a JSON envelope that the proxy turns into `tool_calls`. This is reliable in practice (see [docs/PROTOCOL.md](docs/PROTOCOL.md) for the measured technique) but it is a prompt contract, not a native feature: `tool_choice: required` is advisory, and with tools in the request the answer arrives buffered rather than token-by-token (reasoning still streams live).
 - **No sampling controls.** `temperature`, `top_p` and `max_tokens` are not applied by this endpoint.
 - **Unlimited, not infinite.** Venice's fair-use and Cloudflare bot checks apply. A Cloudflare challenge surfaces as HTTP 401 with a "refresh the cookies" message.
-- **Web session, not API route.** Anything that needs the official API surface (embeddings, images, video, `/responses`) still has to use `api.venice.ai` with an API key. Both can coexist in OpenCode - the installer only *adds* a provider.
+- **Images: what is sent.** The images of your latest message go to the model as images, on every step of the work they start. Images from earlier messages stay in the history as `[image]` and are not sent again. Only pictures inside the request (data URLs, which is what OpenCode sends) are used, up to 10 per message; the proxy never downloads an image from a URL.
+- **Web session, not API route.** Anything that needs the official API surface (embeddings, video, `/responses`) still has to use `api.venice.ai` with an API key. Both can coexist in OpenCode - the installer only *adds* a provider.
 
 ### NUL bytes and `400 Invalid request parameters`
 

@@ -95,7 +95,7 @@ function passwordsFor(browser) {
 function decryptWith(value, passwords) {
   for (const password of passwords) {
     try {
-      return decrypt(value, pbkdf2Sync(password, 'saltysalt', 1, 16, 'sha1'))
+      return decrypt(value, pbkdf2Sync(password, 'saltysalt', process.platform === 'darwin' ? 1003 : 1, 16, 'sha1'))
     } catch {
       /* wrong password for this profile - try the next one */
     }
@@ -154,10 +154,16 @@ export function clientFromCookieDb(dbPath, name) {
 
   const rows = readCookies(copy, COOKIE_HOSTS)
   let client = null
+  let undecryptable = false
   for (const row of rows) {
     if (row.name !== '__client') continue
     client = decryptWith(Buffer.from(row.hex, 'hex'), passwords)
     if (client) break
+    undecryptable = true
+  }
+  if (!client && undecryptable) {
+    const store = process.platform === 'darwin' ? `the Keychain entry "${browser.keychain}"` : 'the keyring password (secret-tool)'
+    throw new Error(`found the venice.ai cookie but could not decrypt it; check ${store}, or pass --cookie/--ua`)
   }
   if (!client) return null
   return { client, userAgent: browserUserAgent(browser), source: browser.label }
