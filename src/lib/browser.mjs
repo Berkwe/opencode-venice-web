@@ -48,6 +48,7 @@ export const isBrowserSupported = (name) => Object.hasOwn(BROWSERS, name)
 export function findLauncher(name) {
   const names = name ? LAUNCHERS[name] : Object.keys(LAUNCHERS).flatMap((key) => LAUNCHERS[key])
   if (!names) throw new Error(`unknown browser: ${name} (expected ${Object.keys(LAUNCHERS).join(', ')})`)
+  if (process.platform === 'win32') throw new Error('automatic browser login is not supported on Windows; use login.ps1 or node src/login.mjs --token')
 
   if (process.platform === 'darwin') {
     for (const candidate of Object.entries(MAC_PATHS)) {
@@ -55,14 +56,14 @@ export function findLauncher(name) {
       if (name && browser !== name) continue
       if (existsSync(bin)) return { browser, bin }
     }
-    throw new Error('no Chromium based browser found in /Applications')
+    throw new Error(name ? `${BROWSERS[name].label} is not installed` : 'no Chromium based browser found in /Applications')
   }
 
   for (const candidate of Object.keys(LAUNCHERS)) {
     if (name && candidate !== name) continue
     for (const bin of LAUNCHERS[candidate]) {
       try {
-        const found = execFileSync('command', ['-v', bin], { shell: '/bin/bash', encoding: 'utf8' }).trim()
+        const found = execFileSync('/bin/sh', ['-c', 'command -v "$1"', 'sh', bin], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
         if (found) return { browser: candidate, bin: found }
       } catch {
         /* try the next one */
@@ -88,7 +89,7 @@ export function findLauncher(name) {
  * on `:1`) is corrected the same way instead of being trusted blindly.
  */
 function ensureDisplay() {
-  if (process.platform === 'darwin') return
+  if (process.platform === 'darwin' || process.platform === 'win32') return
   if (process.env.WAYLAND_DISPLAY) return
 
   const liveSocket = [0, 1].find((num) => existsSync(`/tmp/.X11-unix/X${num}`))
@@ -120,7 +121,7 @@ function ensureDisplay() {
 /** Throws with a readable reason when there is no display to draw the window on. */
 export function assertDisplay() {
   ensureDisplay()
-  if (process.platform === 'darwin') return
+  if (process.platform === 'darwin' || process.platform === 'win32') return
   if (process.env.DISPLAY || process.env.WAYLAND_DISPLAY) return
   throw new Error(
     'no display (DISPLAY/WAYLAND_DISPLAY unset); run this from a desktop session, or pass --cookie/--ua manually',

@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- **Selected phone-checkout fixes merged.** Thinking turns can finish their JSON
+  envelope after native rounds, with finite loop limits retained. Interrupted
+  tool replies are retried instead of dispatching partial calls; failed native
+  external calls cannot leak invented client-tool failures. Transient recovery
+  failures use the remaining bounded budget and cancellation still propagates.
+- **Portable token/menu login.** `--token` accepts a hidden pasted cookie;
+  `--menu` offers token/browser sign-in. Interactive CLI runs show the menu,
+  while `--guided` retains direct browser sign-in. Token refresh keeps the
+  stored User-Agent unless explicitly overridden. Windows PowerShell sign-in,
+  private-file ACLs, automatic provider sync and all 30 chat models are retained.
+
+- **OpenCode V2 provider registration.** Sync now writes native `providers`,
+  `package`, `settings` and model `capabilities`, with only chat models in the
+  session selector. `--default` sets the title agent model in native V2 format.
+  A successful login automatically syncs the provider without changing the
+  selected default. Other providers and configuration settings are preserved.
+
+- **Native Windows launch and manual sign-in.** `install.ps1`, `login.ps1` and
+  `start.ps1` configure and run a checkout without WSL or administrator rights.
+  The hidden cookie prompt passes credentials over stdin, not the command line.
+  Windows browser extraction reports its DPAPI/App-Bound limitation explicitly.
+  Session and temporary curl header files use current-user-only Windows ACLs;
+  POSIX retains mode 600. The curl executable defaults to `curl.exe` on Windows.
+
 - **Merged sign-in and profile fixes.** Guided browser sign-in, absolute profile
   paths, the built-in SQLite fallback and installer sign-in instructions remain
   available alongside the Linux transport and multipart image improvements.

@@ -80,9 +80,22 @@ test('curlFetch hands headers and body to curl and streams the answer back', asy
   if (!findCurl()) return t.skip('curl is not installed')
   const dir = mkdtempSync(path.join(tmpdir(), 'venice-web-test-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
+  let openssl
+  const candidates = ['openssl', ...(process.platform === 'win32' ? [
+    `${process.env.ProgramFiles}/Git/usr/bin/openssl.exe`,
+    `${process.env.LOCALAPPDATA}/Programs/Git/usr/bin/openssl.exe`,
+  ] : [])]
+  for (const candidate of candidates) {
+    try {
+      execFileSync(candidate, ['version'], { stdio: 'ignore' })
+      openssl = candidate
+      break
+    } catch { /* try the next installed executable */ }
+  }
+  if (!openssl) return t.skip('openssl is not installed')
   try {
     execFileSync(
-      'openssl',
+      openssl,
       ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=localhost',
         '-addext', 'subjectAltName=IP:127.0.0.1,DNS:localhost',
         '-keyout', path.join(dir, 'key.pem'), '-out', path.join(dir, 'cert.pem')],
@@ -94,12 +107,17 @@ test('curlFetch hands headers and body to curl and streams the answer back', asy
 
   const server = https.createServer(
     { key: readFileSync(path.join(dir, 'key.pem')), cert: readFileSync(path.join(dir, 'cert.pem')) },
-    (req, res) => {
+      (req, res) => {
+      if (req.url === '/slow') {
+        res.writeHead(200, { 'content-type': 'text/plain' })
+        res.flushHeaders()
+        return
+      }
       const chunks = []
       req.on('data', (chunk) => chunks.push(chunk))
       req.on('end', () => {
         res.writeHead(200, { 'content-type': 'application/json', 'set-cookie': ['a=1', 'b=2'] })
-        res.end(JSON.stringify({ method: req.method, headers: req.headers, rawHeaders: req.rawHeaders, body: Buffer.concat(chunks).toString() }))
+        res.end(JSON.stringify({ method: req.method, headers: req.headers, rawHeaders: req.rawHeaders, body: Buffer.concat(chunks).toString(), bodyBase64: Buffer.concat(chunks).toString('base64') }))
       })
     },
   )
@@ -107,22 +125,13 @@ test('curlFetch hands headers and body to curl and streams the answer back', asy
   t.after(() => server.close())
 
   const before = new Set(readdirSync(tmpdir()))
-  const previous = process.env.CURL_CA_BUNDLE
-  process.env.CURL_CA_BUNDLE = path.join(dir, 'cert.pem')
   let response
-  try {
-    response = await curlFetch(`https://127.0.0.1:${server.address().port}/api`, {
+  response = await curlFetch(`https://127.0.0.1:${server.address().port}/api`, {
       method: 'POST',
       headers: { 'user-agent': 'UA/1', authorization: 'Bearer secret', 'content-type': 'application/json' },
       body: '{"hello":"world"}',
+      caFile: path.join(dir, 'cert.pem'),
     })
-  } catch (error) {
-    if (/code (60|77|35)\b/.test(error.message)) return t.skip(`this curl does not trust a CA bundle from the environment: ${error.message}`)
-    throw error
-  } finally {
-    if (previous === undefined) delete process.env.CURL_CA_BUNDLE
-    else process.env.CURL_CA_BUNDLE = previous
-  }
 
   assert.equal(response.status, 200)
   assert.deepEqual(response.headers.getSetCookie(), ['a=1', 'b=2'])
@@ -135,6 +144,24 @@ test('curlFetch hands headers and body to curl and streams the answer back', asy
   // the user agent comes before the extra headers, where curl puts `-A`
   const names = echo.rawHeaders.filter((_, index) => index % 2 === 0).map((name) => name.toLowerCase())
   assert.ok(names.indexOf('user-agent') < names.indexOf('authorization'))
+  // Binary multipart input must survive Windows pipes, not just JSON strings.
+  const { multipartBody } = await import('../src/lib/venice.mjs')
+  const form = new FormData()
+  const bytes = Buffer.from([0, 255, 13, 10, 128, 1])
+  form.append('request', '{"modelId":"test"}')
+  form.append('media.test', new Blob([bytes], { type: 'image/png' }), 'image')
+  const encoded = await multipartBody(form)
+  const multipart = await curlFetch(`https://127.0.0.1:${server.address().port}/api`, {
+    method: 'POST', headers: { 'content-type': encoded.contentType },
+    body: encoded.body, caFile: path.join(dir, 'cert.pem'),
+  }).then((r) => r.json())
+  const decoded = await new Response(Buffer.from(multipart.bodyBase64, 'base64'), { headers: { 'content-type': multipart.headers['content-type'] } }).formData()
+  assert.deepEqual(Buffer.from(await decoded.get('media.test').arrayBuffer()), bytes)
+  const abort = new AbortController()
+  const slow = await curlFetch(`https://127.0.0.1:${server.address().port}/slow`, { signal: abort.signal, caFile: path.join(dir, 'cert.pem') })
+  const reason = new Error('cancelled test response')
+  abort.abort(reason)
+  await assert.rejects(slow.text(), (error) => error === reason)
   // the header file is gone once the request is over
   const leftovers = readdirSync(tmpdir()).filter((name) => name.startsWith('venice-web-') && !name.startsWith('venice-web-test-') && !before.has(name))
   assert.deepEqual(leftovers, [])

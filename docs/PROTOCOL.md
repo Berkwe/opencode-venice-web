@@ -223,7 +223,25 @@ What the stream shows (debug mode logs it): one `veniceai:tool_call_generation` 
 | 2-3 | a few | the model recovered and sent a proper envelope |
 | 10 (Venice's cap) | 12 of 86 replies | gave up without the result, every time |
 
-Fix: `collectStream()` stops reading once a response starts a 4th step (`SERVER_LOOP_STEPS = 3`), and the request is sent again with `NATIVE_CALL_REMINDER` ("your tools work; the only way to call a tool is `tool_calls`"). It counts as a format retry; the last allowed retry runs to the end so the turn always gets an answer. Format retries and judge checks now have separate budgets (2 each): with a shared budget, two format retries used it up and the last reply reached the user without the judge seeing it. The judge also treats "my tools are unavailable" as `stopped_early` when the tool results it sees worked.
+Current guard: non-thinking native traps with no envelope text stop on the second
+step. Thinking (`enabled`/`adaptive`) may need several native rounds before its
+envelope, so that case gets a finite 40-step ceiling; all other streams keep the
+12-step ceiling. Recovery requests disable reasoning without changing the
+original request. Every retry, including the last, remains bounded.
+
+Format retries and judge checks have separate budgets (2 each). A transient
+network error, HTTP 429 or HTTP 5xx can use the remaining budget; authentication
+failures stop retries and client cancellation propagates immediately. An
+interrupted stream (`response.incomplete` or missing terminal event) is never
+allowed to dispatch a partial envelope. It can be replaced only by a completed
+recovery response. Non-emulated incomplete streams still fail explicitly.
+
+A native call to an external/unrecognized tool followed by a no-tools answer is
+not evidence that the external client ran the tool. That answer is retried and,
+on exhaustion, replaced by a proxy recovery diagnostic rather than the model's
+invented tool-failure report. Legitimate Venice built-ins such as `view_media`
+do not trigger this contamination check unless advertised as external tools.
+All recovery attempts resend the same multipart image attachments.
 
 Measured on the two tasks that triggered it (OpenCode, 6 runs each): before, 2 of 8 and 2 of 12 runs ended with a "tools are broken" answer and the result only came after "Sonucu söyle."; after, 12 of 12 delivered the result in the final message, with 10 loops stopped and retried along the way.
 

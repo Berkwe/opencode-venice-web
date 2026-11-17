@@ -23,6 +23,53 @@ OpenCode ──HTTP──> 127.0.0.1:3456  ──HTTPS + your session cookie─�
 
 ## Quick start
 
+### Windows (PowerShell, no WSL)
+
+Install **Node.js 22+**, Git and `curl.exe` (included in current Windows 10/11).
+From a checkout, run:
+
+```powershell
+.\install.ps1 -Login -Default
+.\start.ps1
+```
+
+The installer configures OpenCode from this checkout; it does not copy files,
+install a Windows service or require administrator rights. Keep the checkout in
+place. `start.ps1` runs in the foreground; stop it with **Ctrl+C**. Use another
+PowerShell window for diagnostics:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:3456/health
+node src/doctor.mjs
+```
+
+If PowerShell blocks local scripts, use a **process-only** policy in that window
+(`Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`), subject to your
+organization's policy. Do not change the machine-wide policy.
+
+**Windows sign-in is manual.** Automatic Chromium cookie extraction is not
+supported because Windows uses DPAPI/App-Bound encryption. `login.ps1` asks for
+the `__client` cookie from `https://clerk.venice.ai` (DevTools → Application →
+Cookies) and the same browser's User-Agent (`navigator.userAgent` in Console).
+Leave the User-Agent prompt blank to use the Windows Chrome 157 default, or
+paste a custom value to override it. You must already be signed in at venice.ai.
+The cookie prompt is hidden and
+passes the value over stdin, not a command-line argument or shell history.
+Never share the cookie or session file. Run `.\login.ps1` again when it expires.
+
+Session files remain at `$HOME\.config\opencode\venice-web\session.json` unless
+overridden by the documented environment variables. Windows session files and
+temporary curl header files receive a current-user-only ACL before secrets are
+written. No browser passwords or Windows encryption keys are read.
+
+Custom port: `.\install.ps1 -Port 4000` followed by `.\start.ps1 -Port 4000`.
+For environment overrides use PowerShell syntax, e.g.
+`$env:VENICE_WEB_CURL = 'C:\Tools\curl\bin\curl.exe'`.
+If Cloudflare rejects the Windows curl TLS fingerprint, try an up-to-date
+OpenSSL build using that override; live upstream compatibility can vary.
+
+### macOS / Linux
+
 ```sh
 git clone https://github.com/CanArslanDev/opencode-venice-web.git
 cd opencode-venice-web
@@ -47,8 +94,8 @@ Prefer doing it by hand? Three commands:
 
 ```sh
 npm install -g .        # or run everything from the checkout with `node src/...`
-venice-web-login        # opens a browser, waits for your sign-in, then stores the cookie
-venice-web-sync --default   # writes the OpenCode provider
+venice-web-login        # interactive token/browser menu; stores session and syncs provider
+venice-web-sync --default   # optionally set the default and title agent model
 venice-web             # starts the proxy on 127.0.0.1:3456
 ```
 
@@ -135,12 +182,15 @@ curl -s 127.0.0.1:3456/v1/images/edits -F image=@photo.png -F 'prompt=make the s
 | Command | What it does |
 | --- | --- |
 | `node src/proxy.mjs` | run the proxy in the foreground |
-| `node src/login.mjs` | guided sign-in: opens a browser, waits for the sign-in, reads the cookie |
+| `node src/login.mjs` | interactive token/browser menu; stores the session and automatically syncs the OpenCode provider |
+| `node src/login.mjs --token` | hidden token prompt (also on Termux/Windows); keeps the stored User-Agent unless `--ua` overrides it |
+| `node src/login.mjs --menu` | explicitly show the sign-in menu |
+| `node src/login.mjs --guided` | open a sign-in browser directly (macOS/Linux) |
 | `node src/login.mjs --browser brave` | pick a browser explicitly for the guided sign-in |
 | `node src/login.mjs --browser brave --profile Default` | skip the window and read an existing profile |
 | `node src/login.mjs --cookie "__client=…" --ua "Mozilla/5.0 …"` | manual mode, e.g. on a machine with no display |
 | `node src/sync.mjs` | add/update the OpenCode provider |
-| `node src/sync.mjs --default` | also set `model` and `small_model` |
+| `node src/sync.mjs --default` | also set `model` and `agents.title.model` |
 | `node src/sync.mjs --remove` | remove the provider again |
 | `node src/doctor.mjs` | diagnose node/session/proxy/config |
 | `npm test` | unit tests for the parser and translator |

@@ -19,8 +19,10 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
-      # Unit tests. `test/smoke.mjs` is picked up here too and skips itself when
-      # no proxy is running (see the header of that file).
+      - name: SQLite and TLS fixture tools
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 openssl
+
+      # Offline tests use only fake upstream responses and loopback HTTPS.
       - name: unit tests
         run: npm test
 
@@ -44,3 +46,28 @@ jobs:
 
       - name: doctor runs
         run: node src/doctor.mjs || true
+
+  windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      - name: SQLite fixture tool
+        run: choco install sqlite --no-progress -y
+      - name: unit tests (including Windows ACL and loopback HTTP)
+        run: npm test
+      - name: PowerShell syntax
+        shell: pwsh
+        run: |
+          foreach ($file in @('install.ps1', 'login.ps1', 'start.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $file), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { throw ($errors | Out-String) }
+          }

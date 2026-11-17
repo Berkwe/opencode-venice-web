@@ -16,7 +16,7 @@
  * often has the browser but not the sqlite3 CLI.
  */
 import { execFileSync } from 'node:child_process'
-import { copyFileSync, existsSync, mkdtempSync, statSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdtempSync, rmSync, statSync } from 'node:fs'
 import { createDecipheriv, pbkdf2Sync } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
@@ -142,17 +142,19 @@ export function clientFromCookieDb(dbPath, name) {
   if (!existsSync(dbPath)) return null
 
   const passwords = passwordsFor(browser)
-  const copy = path.join(mkdtempSync(path.join(tmpdir(), 'venice-cookie-')), 'Cookies')
-  copyFileSync(dbPath, copy)
-  // Chromium keeps recent writes in the rollback journal / WAL until it commits.
-  // Without those side files the copy can look older than it is and a fresh
-  // cookie appears missing.
-  for (const suffix of ['-journal', '-wal']) {
-    const side = `${dbPath}${suffix}`
-    if (existsSync(side)) copyFileSync(side, `${copy}${suffix}`)
+  const folder = mkdtempSync(path.join(tmpdir(), 'venice-cookie-'))
+  const copy = path.join(folder, 'Cookies')
+  let rows
+  try {
+    copyFileSync(dbPath, copy)
+    for (const suffix of ['-journal', '-wal']) {
+      const side = `${dbPath}${suffix}`
+      if (existsSync(side)) copyFileSync(side, `${copy}${suffix}`)
+    }
+    rows = readCookies(copy, COOKIE_HOSTS)
+  } finally {
+    rmSync(folder, { recursive: true, force: true })
   }
-
-  const rows = readCookies(copy, COOKIE_HOSTS)
   let client = null
   let undecryptable = false
   for (const row of rows) {
@@ -208,9 +210,11 @@ export function findCookies({ browser, profile } = {}) {
 
 /** Parses a Cookie header or JSON export into a raw `__client` value. */
 export function clientFromString(input) {
-  const text = input.replace(/^cookie:\s*/i, '')
+  const text = input.trim().replace(/^cookie:\s*/i, '')
   const match = /(?:^|;\s*)__client=([^;]+)/.exec(text)
   if (match) return match[1]
+  // DevTools' cookie Value column contains the bare Clerk JWT, not a header.
+  if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(text)) return text
   try {
     const parsed = JSON.parse(text)
     const list = Array.isArray(parsed) ? parsed : parsed?.cookies

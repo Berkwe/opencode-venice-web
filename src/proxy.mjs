@@ -38,7 +38,9 @@ http.listen(port, host, async () => {
     return null
   })
   if (!session) {
-    warn(`no usable session yet - sign in with: node ${loginCmd}  (or run the login command)`)
+    warn(process.platform === 'win32'
+      ? 'no usable session yet - run login.ps1 from the checkout to paste your browser cookie securely'
+      : `no usable session yet - sign in with: node ${loginCmd}  (or run the login command)`)
     return
   }
   log(`account: ${session.email ?? session.uid ?? 'unknown'} (UA: ${session.userAgent.slice(0, 40)}…)`)

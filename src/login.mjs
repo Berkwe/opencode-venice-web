@@ -8,18 +8,18 @@
  *   node src/login.mjs --cookie "__client=…" --ua "Mozilla/5.0 …"
  *   node src/login.mjs --print                          # also print the UA to copy
  *
- * Guided mode is the default when a display is available and no cookie was
- * passed: a throwaway browser profile opens venice.ai, the user signs in and
- * closes the window, and the cookie is read out of that profile. Nothing is
- * written to the user's own browser profiles.
+ * Interactive terminals offer a token/browser menu. --token opens the hidden
+ * token prompt directly; --menu forces the menu; --guided opens a browser on
+ * macOS/Linux without a menu. Guided profiles never modify the user's profile.
  */
-import { chmodSync, mkdirSync, renameSync, writeFileSync } from 'node:fs'
-import { randomUUID } from 'node:crypto'
-import path from 'node:path'
+import { readFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { clerkBase, clerkVersion, sessionFile } from './lib/config.mjs'
 import { findCookies, clientFromString } from './lib/cookies.mjs'
 import { guidedSignIn, isBrowserSupported } from './lib/browser.mjs'
 import { log, warn } from './lib/log.mjs'
+import { atomicWritePrivateFile } from './lib/private-file.mjs'
 
 const args = process.argv.slice(2)
 const flag = (name, fallback) => {
@@ -35,9 +35,20 @@ const options = {
   timeoutMs: Number(flag('timeout', 15 * 60)) * 1000,
 }
 
-const UA_FALLBACK = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+const UA_FALLBACK = process.platform === 'win32'
+  ? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36'
+  : 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 
 const guided = !options.cookie && !options.profile
+
+function storedUserAgent() {
+  try {
+    const value = JSON.parse(readFileSync(sessionFile, 'utf8')).userAgent
+    return typeof value === 'string' && value.trim() ? value : undefined
+  } catch {
+    return undefined
+  }
+}
 
 const requestHeaders = (client, userAgent) => ({
   'user-agent': userAgent,
@@ -46,10 +57,23 @@ const requestHeaders = (client, userAgent) => ({
   cookie: `__client=${client}`,
 })
 
+/** Clerk can rotate the browser cookie on either identity or token requests. */
+async function clerkRequest(url, credentials, init = {}) {
+  const response = await fetch(url, {
+    ...init,
+    headers: { ...requestHeaders(credentials.client, credentials.userAgent), ...init.headers },
+    redirect: 'error',
+    signal: AbortSignal.timeout(30_000),
+  })
+  const rotated = response.headers.getSetCookie().find((value) => value.startsWith('__client='))
+  if (rotated) credentials.client = rotated.slice('__client='.length).split(';')[0] || credentials.client
+  return response
+}
+
 /** Verifies the cookie against Clerk and returns the active session + user. */
 async function resolveAccount(client, userAgent) {
-  const headers = requestHeaders(client, userAgent)
-  const response = await fetch(`${clerkBase}/v1/client${clerkVersion}`, { headers, redirect: 'error' })
+  const credentials = { client, userAgent }
+  const response = await clerkRequest(`${clerkBase}/v1/client${clerkVersion}`, credentials)
   if (!response.ok) throw new Error(`Clerk rejected the session (HTTP ${response.status}); sign in to venice.ai again`)
   const data = await response.json()
   const sessions = (data.response?.sessions ?? data.client?.sessions ?? []).filter((item) => item.status === 'active')
@@ -58,24 +82,73 @@ async function resolveAccount(client, userAgent) {
   const user = session.user ?? {}
   const email =
     user.email_addresses?.find((item) => item.id === user.primary_email_address_id)?.email_address ?? user.id ?? 'unknown'
-  return { session, email, uid: user.id }
+  return { session, email, uid: user.id, client: credentials.client }
 }
 
 async function mint(client, userAgent, sessionId) {
-  const response = await fetch(`${clerkBase}/v1/client/sessions/${sessionId}/tokens${clerkVersion}`, {
+  const credentials = { client, userAgent }
+  const response = await clerkRequest(`${clerkBase}/v1/client/sessions/${encodeURIComponent(sessionId)}/tokens${clerkVersion}`, credentials, {
     method: 'POST',
-    headers: { ...requestHeaders(client, userAgent), 'content-type': 'application/x-www-form-urlencoded' },
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: 'organization_id=&tab_state=focused&force_origin=true',
   })
   if (!response.ok) throw new Error(`could not mint a session token (HTTP ${response.status})`)
   const { jwt } = await response.json()
   const claims = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString('utf8'))
-  return { jwt, expires: claims.exp * 1000 }
+  if (!Number.isFinite(claims.exp) || claims.exp * 1000 <= Date.now()) throw new Error('Clerk returned an invalid or expired session token')
+  return { jwt, expires: claims.exp * 1000, client: credentials.client }
 }
 
-/** Reads the cookie either from a guided sign-in or from an existing profile. */
-async function collectCookie() {
+/** Collects a manual token, piped credentials, guided sign-in or profile cookie. */
+async function collectCookie({ skipMenu = false } = {}) {
+  if (args.includes('--stdin')) {
+    if (options.cookie) throw new Error('use either --stdin or --cookie, not both')
+    if (process.stdin.isTTY) throw new Error('--stdin expects JSON piped to standard input; use login.ps1 on Windows')
+    const chunks = []
+    let size = 0
+    for await (const chunk of process.stdin) {
+      size += chunk.length
+      if (size > 64 * 1024) throw new Error('login input is too large')
+      chunks.push(chunk)
+    }
+    let input
+    try {
+      input = JSON.parse(Buffer.concat(chunks).toString('utf8').replace(/^\uFEFF/, ''))
+    } catch {
+      throw new Error('login input must be JSON with cookie and userAgent strings')
+    }
+    if (typeof input?.cookie !== 'string' || typeof input?.userAgent !== 'string' || !input.userAgent.trim()) {
+      throw new Error('login input requires cookie and userAgent strings')
+    }
+    return { client: clientFromString(input.cookie), userAgent: input.userAgent.trim(), source: 'manual (stdin)' }
+  }
   if (options.cookie) return { client: clientFromString(options.cookie), userAgent: options.userAgent, source: 'manual' }
+  const interactiveDefault = process.stdin.isTTY && !options.browser && !options.profile && !args.includes('--guided')
+  if (!skipMenu && (args.includes('--token') || args.includes('--menu') || interactiveDefault)) {
+    const { createPrompter } = await import('./lib/prompt.mjs')
+    const prompt = createPrompter()
+    try {
+      let choice = '1'
+      if (!args.includes('--token')) {
+        log('How do you want to sign in?')
+        log('  1) Paste a token (default)')
+        if (process.platform !== 'win32') log('  2) Browser sign-in')
+        choice = (await prompt.ask('> ')) || '1'
+      }
+      if (choice === '1') {
+        log('Copy __client from a clerk.venice.ai cookie or request in browser DevTools.')
+        const client = clientFromString(await prompt.ask('__client token (hidden): ', { echo: false }))
+        return { client, userAgent: options.userAgent ?? storedUserAgent() ?? UA_FALLBACK, source: 'token' }
+      }
+      if (choice !== '2' || process.platform === 'win32') throw new Error('invalid sign-in choice')
+    } finally {
+      prompt.close()
+    }
+    return collectCookie({ skipMenu: true })
+  }
+  if (process.platform === 'win32') {
+    throw new Error('automatic browser cookie extraction is not supported on Windows (DPAPI/App-Bound encryption); run .\\login.ps1 or pass --cookie and --ua')
+  }
 
   if (guided) {
     const found = await guidedSignIn({
@@ -93,11 +166,7 @@ async function collectCookie() {
         }
       },
     })
-    try {
-      return { ...found, cleanup: found.cleanup }
-    } finally {
-      /* cleanup runs after the caller is done */
-    }
+    return found
   }
 
   if (options.browser && !isBrowserSupported(options.browser)) {
@@ -118,27 +187,25 @@ async function main() {
   }
 
   const client = collected.client
-  const userAgent =
-    collected.userAgent ??
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+  const userAgent = collected.userAgent?.trim() || storedUserAgent() || UA_FALLBACK
   const source = collected.source
 
   if (args.includes('--print')) log(`User-Agent: ${userAgent}`)
 
   try {
-    const { session, email, uid } = await resolveAccount(client, userAgent)
-    const { jwt, expires } = await mint(client, userAgent, session.id)
+    const { session, email, uid, client: refreshedClient } = await resolveAccount(client, userAgent)
+    const { jwt, expires, client: finalClient } = await mint(refreshedClient, userAgent, session.id)
 
-    const state = { version: 1, source, userAgent, client, uid, sessionId: session.id, email, access: jwt, expires }
-    mkdirSync(path.dirname(sessionFile), { recursive: true })
-    const tmp = `${sessionFile}.${randomUUID()}.tmp`
-    writeFileSync(tmp, JSON.stringify(state, null, 1), { mode: 0o600 })
-    renameSync(tmp, sessionFile)
-    chmodSync(sessionFile, 0o600)
+    const state = { version: 1, source, userAgent, client: finalClient, uid, sessionId: session.id, email, access: jwt, expires }
+    atomicWritePrivateFile(sessionFile, JSON.stringify(state, null, 1))
 
     log(`signed in as ${email} (via ${source})`)
     log(`session file: ${sessionFile}`)
     warn('keep this file private: it contains a live session cookie.')
+    const sync = spawnSync(process.execPath, [fileURLToPath(new URL('./sync.mjs', import.meta.url))], { stdio: 'inherit' })
+    if (sync.error || sync.status !== 0) {
+      warn('signed in, but OpenCode provider sync failed; run node src/sync.mjs to retry')
+    }
   } finally {
     collected.cleanup?.()
   }

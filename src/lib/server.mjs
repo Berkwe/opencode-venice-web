@@ -123,7 +123,7 @@ function modelList() {
  * The returned generator resolves to the collected state. With `stopServerLoop`
  * it stops early when Venice's own agent loop runs past `SERVER_LOOP_STEPS` and
  * sets `serverLoop` (see the comment in `apply`).
- * @returns {AsyncGenerator<object, {text: string, answer: string, reasoning: string, terminal: boolean, chunks: object[], steps: Set<string>, nativeTools: Set<string>, serverLoop: boolean}>}
+ * @returns {AsyncGenerator<object, {text: string, answer: string, reasoning: string, terminal: boolean, chunks: object[], steps: Set<string>, nativeTools: Set<string>, nativeExternalTools: Set<string>, serverLoop: boolean, incomplete: boolean}>}
  */
 export async function* collectStream(upstreamBody, mapping, chunk, { stopServerLoop = false } = {}) {
   const reader = upstreamBody.getReader()
@@ -136,7 +136,9 @@ export async function* collectStream(upstreamBody, mapping, chunk, { stopServerL
     chunks: [],
     steps: new Set(),
     nativeTools: new Set(),
+    nativeExternalTools: new Set(),
     serverLoop: false,
+    incomplete: false,
     events: {},
   }
   const itemTypes = new Map()
@@ -163,11 +165,15 @@ export async function* collectStream(upstreamBody, mapping, chunk, { stopServerL
       }
     }
     if (event.type === 'veniceai:tool_call_generation.in_progress') {
-      for (const tool of event.detected_tools ?? []) if (tool?.name) state.nativeTools.add(tool.name)
+      for (const tool of event.detected_tools ?? []) {
+        if (!tool?.name) continue
+        state.nativeTools.add(tool.name)
+        if (tool.type === 'Unrecognized' || mapping.toolNames?.has(tool.name)) state.nativeExternalTools.add(tool.name)
+      }
     }
     if (event.item?.type === 'veniceai:tool_call_generation' && event.item.id) {
       state.steps.add(event.item.id)
-      if (stopServerLoop && mapping.emulatedTools && serverLoopReached(state)) {
+      if (stopServerLoop && mapping.emulatedTools && serverLoopReached(state, mapping.request?.reasoningMode)) {
         state.serverLoop = true
         state.terminal = true
         return STOP
@@ -193,7 +199,11 @@ export async function* collectStream(upstreamBody, mapping, chunk, { stopServerL
       state.terminal = true
       return STOP
     }
-    if (event.type === 'response.incomplete') throw new Error('Venice generation was incomplete')
+    if (event.type === 'response.incomplete') {
+      if (!mapping.emulatedTools) throw new Error('Venice generation was incomplete')
+      state.incomplete = true
+      return STOP
+    }
     return null
   }
 
@@ -221,15 +231,18 @@ export async function* collectStream(upstreamBody, mapping, chunk, { stopServerL
 const STOP = Symbol('stop')
 
 /**
- * Venice agent steps allowed in one response before the proxy stops it. One
- * step is a normal reply; a second or third is the model recovering from one
- * native call; past that it is looping on "Tool not found" (measured: every
- * 10-step response gave up without a result).
+ * Finite ceilings for Venice's internal loop. Thinking/native rounds can need
+ * more time before envelope text arrives; non-thinking native traps stop early.
  */
 const SERVER_LOOP_STEPS = 12
+const THINKING_NATIVE_STEPS = 40
 
-function serverLoopReached(state) {
-  return state.steps.size > SERVER_LOOP_STEPS || (state.steps.size > 1 && state.nativeTools.size > 0 && !state.text)
+function serverLoopReached(state, reasoningMode) {
+  // Thinking can emit several native rounds before its first JSON envelope.
+  // Do not cut that turn at step 2; keep a finite ceiling in every mode.
+  const thinking = reasoningMode === 'enabled' || reasoningMode === 'adaptive'
+  if (thinking && !state.text && state.nativeTools.size) return state.steps.size > THINKING_NATIVE_STEPS
+  return state.steps.size > SERVER_LOOP_STEPS || (!thinking && state.steps.size > 1 && state.nativeTools.size > 0 && !state.text)
 }
 
 /**
@@ -273,7 +286,7 @@ async function askJudge(body, message, signal) {
  * upstream attempt (free on the web plan). `preferAnswer()` decides whether the
  * retry replaces the first answer, so a retry can never blank out a good reply.
  */
-async function* openaiChunks(body, mapping, upstreamBody, signal, trace = { log, warn }) {
+export async function* openaiChunks(body, mapping, upstreamBody, signal, trace = { log, warn }, { chat = upstreamChat, judge = askJudge } = {}) {
   const { log, warn } = trace
   const id = `chatcmpl-${randomUUID().replaceAll('-', '')}`
   const created = Math.floor(Date.now() / 1000)
@@ -307,8 +320,16 @@ async function* openaiChunks(body, mapping, upstreamBody, signal, trace = { log,
         log(`  ~ venice tool loop stopped after ${collected.steps.size} steps (native calls: ${[...collected.nativeTools].join(', ') || '?'})`)
         return serverLoopMessage()
       }
+      // A partial envelope is not safe to dispatch, even if JSON repair finds
+      // what looks like a complete tool call before the interrupted stream.
+      if (!collected.terminal) return { ...serverLoopMessage(), incomplete: true }
       const parsed = parseToolReply(text)
       for (const rename of inspectCalls(parsed, mapping.toolSchemas)) log(`  ~ tool name ${rename}`)
+      // Failed native external calls are not evidence of client tool execution.
+      // Legitimate Venice built-ins (e.g. view_media) must not taint an answer.
+      if (collected.nativeExternalTools.size && !parsed.tool_calls?.length) {
+        return { ...serverLoopMessage(), nativeContamination: true }
+      }
       return parsed
     }
     message = read(state.text, state)
@@ -324,11 +345,12 @@ async function* openaiChunks(body, mapping, upstreamBody, signal, trace = { log,
     // last retry produced reached the user without the judge ever seeing it
     // (a made-up "the tools all returned Tool not found", 2026-11-05).
     for (;;) {
+      signal?.throwIfAborted()
       let decision = shouldRetry({ message, lastRole: last?.role, available })
       if (decision.judge) {
         if (!judgeEnabled || judged >= 2) break
         judged++
-        const verdict = await askJudge(body, message, signal)
+        const verdict = await judge(body, message, signal)
         if (verdict) log(`  ~ judge: ${verdict.verdict}${verdict.reason ? ` (${preview(verdict.reason, 100)})` : ''}`)
         decision = judgeDecision(verdict?.verdict)
       }
@@ -339,17 +361,18 @@ async function* openaiChunks(body, mapping, upstreamBody, signal, trace = { log,
       try {
         // the retry resends the same image parts, so their bytes go along again
         recoveryRequest = withRetryReminder(recoveryRequest, decision.reminder)
-        const retryResponse = await upstreamChat(recoveryRequest, INFERENCE_PATH, signal, mapping.images)
+        const retryResponse = await chat(recoveryRequest, INFERENCE_PATH, signal, mapping.images)
         if (!retryResponse.ok) {
           await retryResponse.body?.cancel()
+          if (retryResponse.status === 429 || retryResponse.status >= 500) continue
           break
         }
-        // the last allowed retry runs to the end, so the turn always gets an answer
+        // Recovery always has a finite loop guard, including the last retry.
         const retryState = yield* collectStream(retryResponse.body, mapping, chunk, {
           stopServerLoop: true,
         })
         const retryMessage = read(retryState.text, retryState)
-        if (preferAnswer(retryMessage, message, { replaceAnswer: decision.replaceAnswer })) {
+        if (retryState.terminal && (!state.terminal || preferAnswer(retryMessage, message, { replaceAnswer: decision.replaceAnswer }))) {
           state = retryState
           message = retryMessage
           log('  ~ retry improved the reply')
@@ -359,13 +382,15 @@ async function* openaiChunks(body, mapping, upstreamBody, signal, trace = { log,
         }
       } catch (error) {
         warn('  ~ retry failed:', error.message)
-        break
+        if (signal?.aborted) throw error
+        // A transient failure must not discard the remaining bounded budget.
+        continue
       }
     }
 
     // Never forward a blank assistant turn: it is invisible in the client.
     rejectInvalidCalls(message)
-    applyFallback(message, state.text)
+    applyFallback(message, message.serverLoop ? '' : state.text)
   }
 
   if (!state.terminal) throw new Error('the Venice stream ended before response.completed')

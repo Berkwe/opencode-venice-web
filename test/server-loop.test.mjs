@@ -41,7 +41,7 @@ async function drain(generator) {
 const mapping = { emulatedTools: true, request: { modelId: 'm' } }
 const chunk = (delta) => ({ delta })
 
-test('collectStream stops a Venice tool loop past three steps', async () => {
+test('collectStream stops a non-thinking native tool loop at the second step', async () => {
   const events = [...step(0), ...step(1), ...step(2), ...step(3), ...step(4), ...message(5, 'gave up')]
   const { body, wasCancelled } = sse(events, { close: false })
   const state = await drain(collectStream(body, mapping, chunk, { stopServerLoop: true }))
@@ -99,6 +99,17 @@ test('collectStream reads a loop to the end when stopping is off (last retry)', 
   assert.equal(state.text, 'gave up')
 })
 
+test('thinking without native calls keeps a finite 12-step ceiling, not a two-step cutoff', async () => {
+  const events = Array.from({ length: 14 }, (_, n) => ({
+    type: 'response.output_item.added', output_index: n,
+    item: { type: 'veniceai:tool_call_generation', id: `step-${n}` },
+  }))
+  const state = await drain(collectStream(sse(events).body,
+    { ...mapping, request: { modelId: 'm', reasoningMode: 'enabled' } }, chunk, { stopServerLoop: true }))
+  assert.equal(state.serverLoop, true)
+  assert.equal(state.steps.size, 13)
+})
+
 test('shouldRetry: a stopped Venice loop is retried with the native-call reminder', () => {
   assert.deepEqual(shouldRetry({ message: serverLoopMessage(), lastRole: 'tool' }), {
     retry: true,
@@ -114,20 +125,31 @@ test('preferAnswer: any real reply beats a stopped loop', () => {
 })
 
 for (const reasoningMode of ['enabled', 'adaptive']) {
-  test(`collectStream cuts native tool loops with reasoning ${reasoningMode}`, async () => {
+  test(`collectStream lets a thinking reply recover after native rounds (${reasoningMode})`, async () => {
     const events = [
       { type: 'response.reasoning_text.delta', delta: 'I need shell_exec' },
-      ...step(0, 'shell_exec'), ...step(1, 'shell_exec'),
-      ...message(2, 'All tools returned Tool not found'),
+      ...Array.from({ length: 10 }, (_, n) => step(n, 'shell_exec')).flat(),
+      ...message(10, '{"content":"","status":"continue","tool_calls":[{"name":"shell_exec","arguments":{}}]}'),
     ]
     const { body, wasCancelled } = sse(events, { close: false })
     const state = await drain(collectStream(body,
       { ...mapping, request: { modelId: 'm', reasoningMode } }, chunk,
       { stopServerLoop: true }))
-    assert.equal(state.serverLoop, true)
-    assert.equal(state.steps.size, 2)
-    assert.equal(state.text, '')
+    assert.equal(state.serverLoop, false)
+    assert.equal(state.steps.size, 10)
+    assert.match(state.text, /shell_exec/)
     assert.equal(state.reasoning, 'I need shell_exec')
+    assert.equal(wasCancelled(), true)
+  })
+
+  test(`collectStream still bounds thinking native loops (${reasoningMode})`, async () => {
+    const events = Array.from({ length: 42 }, (_, n) => step(n)).flat()
+    const { body, wasCancelled } = sse(events, { close: false })
+    const state = await drain(collectStream(body,
+      { ...mapping, request: { modelId: 'm', reasoningMode } }, chunk,
+      { stopServerLoop: true }))
+    assert.equal(state.serverLoop, true)
+    assert.equal(state.steps.size, 41)
     assert.equal(wasCancelled(), true)
   })
 
@@ -148,7 +170,7 @@ for (const reasoningMode of ['enabled', 'adaptive']) {
   })
 }
 
-test('native loop recovery disables thinking without mutating original request', () => {
+test('all recovery reminders disable thinking without mutating the original request', () => {
   for (const reasoningMode of ['enabled', 'adaptive']) {
     const request = { reasoningMode, messages: [], tools: [], clientTools: [] }
     const retried = withRetryReminder(request, NATIVE_CALL_REMINDER)
@@ -156,7 +178,7 @@ test('native loop recovery disables thinking without mutating original request',
     assert.equal(request.reasoningMode, reasoningMode)
     assert.equal(request.messages.length, 0)
     assert.match(retried.messages.at(-1).content[0].text, /ONLY way/)
-    assert.equal(withRetryReminder(request, 'format only').reasoningMode, reasoningMode)
+    assert.equal(withRetryReminder(request, 'format only').reasoningMode, 'disabled')
   }
 })
 

@@ -6,9 +6,7 @@
  * exchanged for a ~60 second session JWT. This module owns that exchange and
  * keeps the cookie rotation that Clerk performs while it happens.
  */
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
-import { randomUUID } from 'node:crypto'
-import path from 'node:path'
+import { readFile } from 'node:fs/promises'
 import {
   apiBase,
   attestationTtlMs,
@@ -21,12 +19,14 @@ import {
   transport,
 } from './config.mjs'
 import { curlFetch, findCurl, isCloudflareBlock } from './curl.mjs'
+import { atomicWritePrivateFile } from './private-file.mjs'
 
 const INFERENCE_PATH = '/api/inference/chat/agents/ad-hoc'
 /** Venice's own agent, which makes images; `paidImagesMode=block` keeps it on free models (docs/PROTOCOL.md §5b). */
 const AGENT_IMAGE_PATH = '/api/inference/chat/agents/venice?paidImagesMode=block'
 
 let state = null
+let sessionFlight = null
 let tokenFlight = null
 let attestation = null
 
@@ -40,9 +40,13 @@ export class SignInError extends Error {
 }
 
 export async function readSession() {
-  const raw = await readFile(sessionFile, 'utf8')
-  const data = JSON.parse(raw)
-  if (!data.client || !data.userAgent) {
+  let data
+  try {
+    data = JSON.parse(await readFile(sessionFile, 'utf8'))
+  } catch {
+    throw new SignInError(`cannot read the stored session (${sessionFile}); run the login command`)
+  }
+  if (typeof data?.client !== 'string' || !data.client || typeof data?.userAgent !== 'string' || !data.userAgent) {
     throw new SignInError(`session file is incomplete (${sessionFile}); run the login command again`)
   }
   return data
@@ -50,19 +54,24 @@ export async function readSession() {
 
 export async function loadSession({ force = false } = {}) {
   if (state && !force) return state
-  state = await readSession()
-  return state
+  if (sessionFlight && !force) return sessionFlight
+  const pending = readSession()
+  sessionFlight = pending
+  try {
+    state = await pending
+    return state
+  } finally {
+    if (sessionFlight === pending) sessionFlight = null
+  }
 }
 
 export async function saveSession() {
-  const tmp = `${sessionFile}.${randomUUID()}.tmp`
-  await mkdir(path.dirname(sessionFile), { recursive: true })
-  await writeFile(tmp, JSON.stringify(state, null, 1), { mode: 0o600 })
-  await rename(tmp, sessionFile)
+  atomicWritePrivateFile(sessionFile, JSON.stringify(state, null, 1))
 }
 
 export function resetSessionCache() {
   state = null
+  sessionFlight = null
   tokenFlight = null
   attestation = null
 }

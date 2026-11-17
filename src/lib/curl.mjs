@@ -24,9 +24,10 @@
  * `/proc/self/fd/N`, so curl exited with code 26 before sending anything.
  */
 import { spawn, execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { writePrivateFile } from './private-file.mjs'
 
 let curlPath
 let curlVersion = ''
@@ -34,7 +35,7 @@ let curlVersion = ''
 /** The curl binary (VENICE_WEB_CURL overrides), or null when none is installed. */
 export function findCurl() {
   if (curlPath !== undefined) return curlPath
-  const candidates = [process.env.VENICE_WEB_CURL, 'curl'].filter(Boolean)
+  const candidates = [process.env.VENICE_WEB_CURL, process.platform === 'win32' ? 'curl.exe' : 'curl'].filter(Boolean)
   curlPath = null
   for (const candidate of candidates) {
     try {
@@ -108,7 +109,7 @@ export function writeHeaderFile(headers, dir = tmpdir()) {
     rmSync(folder, { recursive: true, force: true })
   }
   try {
-    writeFileSync(file, headerLines(headers), { mode: 0o600, flag: 'wx' })
+    writePrivateFile(file, headerLines(headers))
   } catch (error) {
     remove()
     throw error
@@ -140,7 +141,7 @@ export function parseHead(buffer) {
 }
 
 /** `fetch()` lookalike backed by curl; resolves to a Response with a streaming body. */
-export function curlFetch(url, { method = 'GET', headers, body, signal } = {}) {
+export function curlFetch(url, { method = 'GET', headers, body, signal, caFile } = {}) {
   if (signal?.aborted) return Promise.reject(signal.reason ?? new Error('aborted'))
   const bin = findCurl()
   if (!bin) return Promise.reject(new Error('curl is not installed (needed for the Venice inference route)'))
@@ -161,11 +162,14 @@ export function curlFetch(url, { method = 'GET', headers, body, signal } = {}) {
       return reject(error)
     }
     const args = ['-sS', '--http1.1', '--no-buffer', '--proto', '=https', ...curlTlsArgs(), '-D', '-', '-X', method, '-H', `@${headerFile.file}`]
+    // Explicit custom trust also works with Windows Schannel, which ignores
+    // CURL_CA_BUNDLE. Never disable TLS verification.
+    if (caFile) args.push('--cacert', caFile)
     if (userAgent) args.push('-A', userAgent)
     if (body != null) args.push('--data-binary', '@-')
     args.push(url)
 
-    const child = spawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'] })
+    const child = spawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
     let head = Buffer.alloc(0)
     let controller = null
     let settled = false

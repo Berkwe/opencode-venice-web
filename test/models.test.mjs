@@ -12,6 +12,12 @@ test('DEFAULT_MODEL is a real catalogue id', () => {
   assert.ok(modelIds.includes(DEFAULT_MODEL))
 })
 
+test('the fork catalogue retains DeepSeek 1017 and its original limits', () => {
+  assert.ok(modelIds.includes('deepseek-v4-1-flash-1017'))
+  assert.equal(MODELS['deepseek-v4-1-flash-1017'].context, 1000000)
+  assert.equal(MODELS['deepseek-v4-1-flash-1017'].output, 131072)
+})
+
 test('DEFAULT_SMALL_MODEL is a real catalogue id', () => {
   assert.ok(MODELS[DEFAULT_SMALL_MODEL], `DEFAULT_SMALL_MODEL missing from MODELS: ${DEFAULT_SMALL_MODEL}`)
 })

@@ -20,7 +20,10 @@ import { DEFAULT_MODEL } from '../src/lib/models.mjs'
 
 const base = `http://${host}:${port}`
 const require_ = process.env.SMOKE_REQUIRE === '1'
-const check = (name, ok, detail = '') => console.log(`${ok ? ' ok ' : 'FAIL'}  ${name}${detail ? ` - ${detail}` : ''}`)
+const check = (name, ok, detail = '') => {
+  console.log(`${ok ? ' ok ' : 'FAIL'}  ${name}${detail ? ` - ${detail}` : ''}`)
+  assert.ok(ok, `${name}${detail ? `: ${detail}` : ''}`)
+}
 
 const skip = (reason) => {
   if (require_) {
@@ -42,6 +45,8 @@ check('proxy reachable', true, `${health.provider ?? 'venice-web'}, ${health.mod
 const models = await fetch(`${base}/v1/models`).then((response) => response.json())
 check('model list', models.data?.length > 0, `${models.data?.length ?? 0} models`)
 assert.ok(models.data.some((model) => model.id === DEFAULT_MODEL), `default model ${DEFAULT_MODEL} is missing`)
+const model = process.env.SMOKE_MODEL || DEFAULT_MODEL
+assert.ok(models.data.some((entry) => entry.id === model), `requested model ${model} is missing`)
 
 if (!health.ok) skip('proxy is up but no session is signed in (never ran login)')
 
@@ -49,10 +54,11 @@ const answer = await fetch(`${base}/v1/chat/completions`, {
   method: 'POST',
   headers: { 'content-type': 'application/json' },
   body: JSON.stringify({
-    model: DEFAULT_MODEL,
+    model,
     stream: false,
     messages: [{ role: 'user', content: 'Reply with the single word: pong' }],
   }),
+  signal: AbortSignal.timeout(120_000),
 }).then((response) => response.json())
 check(
   'plain answer',
@@ -65,6 +71,7 @@ const picture = await fetch(`${base}/v1/images/generations`, {
   method: 'POST',
   headers: { 'content-type': 'application/json' },
   body: JSON.stringify({ prompt: 'a red apple on a white table', size: '512x512' }),
+  signal: AbortSignal.timeout(120_000),
 }).then((response) => response.json())
 const png = picture.data?.[0]?.b64_json ? Buffer.from(picture.data[0].b64_json, 'base64') : null
 check(
@@ -77,23 +84,23 @@ const tooled = await fetch(`${base}/v1/chat/completions`, {
   method: 'POST',
   headers: { 'content-type': 'application/json' },
   body: JSON.stringify({
-    model: DEFAULT_MODEL,
+    model,
     stream: false,
-    messages: [{ role: 'user', content: 'Use the bash tool to list /tmp. Do not answer before calling it.' }],
+    messages: [{ role: 'user', content: 'Use the shell tool to print the current working directory. Do not answer before calling it.' }],
     tools: [
       {
         type: 'function',
         function: {
-          name: 'bash',
+          name: 'shell',
           description: 'Run a shell command',
           parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
         },
       },
     ],
   }),
+  signal: AbortSignal.timeout(120_000),
 }).then((response) => response.json())
 const calls = tooled.choices?.[0]?.message?.tool_calls ?? []
 check('emulated tool call', calls.length > 0, calls.map((call) => call.function.name).join(',') || tooled.error?.message || '')
-if (!calls.length) skip('the model answered without calling the tool (see docs/TROUBLESHOOTING.md)')
 
 console.log('\nsmoke test passed')

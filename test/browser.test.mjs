@@ -34,6 +34,7 @@ test('assertDisplay accepts an X session', () => {
 })
 
 test('assertDisplay explains the manual fallback when there is no display', () => {
+  if (process.platform !== 'linux') return
   // ensureDisplay() probes the real X sockets, so the check is only meaningful
   // on a machine without one (a desktop box legitimately resolves :0).
   const noXSocket = ![0, 1].some((num) => existsSync(`/tmp/.X11-unix/X${num}`))
@@ -62,7 +63,7 @@ test('findLauncher reports a missing browser by label', () => {
   const saved = process.env.PATH
   process.env.PATH = '/nonexistent'
   try {
-    assert.throws(() => findLauncher('brave'), /Brave is not installed/)
+    assert.throws(() => findLauncher('brave'), process.platform === 'win32' ? /login.ps1.*--token/ : /Brave is not installed/)
   } finally {
     process.env.PATH = saved
   }
@@ -72,8 +73,7 @@ test('profileRoot points at the config dir', () => {
   assert.match(profileRoot(), /\.config$/)
 })
 
-test('guided sign-in cleans up after itself', async () => {
-  // Exercised only where a browser exists; the module is imported eagerly either way.
+test('guided sign-in API is available without starting a real browser', async () => {
   const { guidedSignIn } = await import('../src/lib/browser.mjs')
   assert.equal(typeof guidedSignIn, 'function')
 })

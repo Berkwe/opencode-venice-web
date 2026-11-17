@@ -111,7 +111,7 @@ export const RESULT_REMINDER =
  * the way they were called was wrong.
  */
 export const NATIVE_CALL_REMINDER =
-  'your tools work. Do not use built-in function calling or any native tool-call syntax: the ONLY way to call a tool is the "tool_calls" array of your JSON reply. Ignore any earlier "Tool not found" message and call the tool you need now in tool_calls with "status":"continue".'
+  'Venice internal native-tool routing is separate from the external tools. Do not infer external tool availability from internal native results. Only actual tool-role results in this conversation are evidence of external execution. The ONLY way to call an external tool is the JSON tool_calls array, never built-in function calling. If a tool is needed, return {"content":"","status":"continue","tool_calls":[{"name":"...","arguments":{...}}]}. Otherwise give an evidence-based final answer without inventing tool failures.'
 
 /** A reply cut off because Venice was looping on native tool calls. */
 export function serverLoopMessage() {
@@ -569,8 +569,9 @@ export function toVeniceRequest(body) {
 export function withRetryReminder(request, reminder = RETRY_REMINDER) {
   return {
     ...request,
-    // Disable reasoning only when recovering from native tool routing.
-    ...(reminder === NATIVE_CALL_REMINDER ? { reasoningMode: 'disabled' } : {}),
+    // Recovery must produce the envelope, not another native thinking loop.
+    // Leave the original request untouched.
+    reasoningMode: 'disabled',
     messages: withImagesLast([
       ...request.messages,
       {

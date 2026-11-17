@@ -28,6 +28,9 @@
     "packaging",
     "README.md",
     "CLAUDE.md",
+    "install.ps1",
+    "login.ps1",
+    "start.ps1",
     "LICENSE"
   ],
   "scripts": {
@@ -37,10 +40,10 @@
     "doctor": "node ./src/doctor.mjs",
     "test": "node --test test/*.test.mjs",
     "test:smoke": "node test/smoke.mjs",
-    "doctor": "node src/doctor.mjs"
+    "test:live": "node scripts/verify-live.mjs"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/CanArslanDev/opencode-venice-web.git"
+    "url": "https://github.com/Berkwe/opencode-venice-web.git"
   }
 }

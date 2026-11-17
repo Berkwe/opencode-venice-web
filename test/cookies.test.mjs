@@ -4,7 +4,16 @@ import { execFileSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { clientFromCookieDb } from '../src/lib/cookies.mjs'
+import { clientFromCookieDb, clientFromString } from '../src/lib/cookies.mjs'
+
+test('manual cookie input accepts a bare JWT, a cookie header or a JSON export', () => {
+  const value = 'eyJhbGciOiJSUzI1NiJ9.eyJpZCI6ImNsaWVudF90ZXN0In0.dGVzdC1zaWduYXR1cmU'
+  for (const input of [value, `  ${value}\r\n`, `__client=${value}`, `Cookie: a=1; __client=${value}; b=2`, JSON.stringify([{ name: '__client', value }])]) {
+    assert.equal(clientFromString(input), value)
+  }
+  assert.throws(() => clientFromString('not a cookie'), /no __client cookie/)
+  assert.throws(() => clientFromString(''), /no __client cookie/)
+})
 
 /** Builds a tiny cookie database with the Chromium schema and one cookie. */
 function cookieDb(dir, { value = 'v10payload' } = {}) {
