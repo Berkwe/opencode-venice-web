@@ -154,14 +154,14 @@ A small model asked for a custom format is *usually* compliant, but not always. 
 | Measure | Effect |
 | --- | --- |
 | **Format reminder as the last user message** (`(format reminder) …`, two variants depending on whether the last real message is a tool result) | the strongest single lever: `1/4 → 4/4` tool use on a task that needs files |
-| **System prompt rewritten to envelope form + "these ARE called directly, not inside `execute`"** | the OpenCode Code Mode paragraph ("the tools listed below cannot be called directly") otherwise convinces the model that tools are broken |
+| **System prompt rewritten to envelope form + a case-aware call instruction** | direct tools keep "these ARE called directly"; when the only tool is a Code Mode runner (`execute`/`run_code`) the prompt says to call the runner and use the nested tools inside its code. The old blanket "not inside `execute`" wording made models put `pwsh`/`read`/`shell` into `tool_calls`, where every call was rejected (§4.8) |
 | **Assistant history re-serialised as envelopes** | the model imitates its own previous turns; a plain-text assistant turn makes it drop the format |
 | **Retry when the reply is unhelpful**: prose, an envelope without tool calls on a first turn, or an *empty* reply | turns the remaining flakes into successes; free on the web plan |
 | **Broken JSON is repaired, not dropped**: repair ladder (control chars, trailing commas, raw `arguments` blobs) + `salvageCalls()` + `cleanLeakedEnvelope()` | a raw file dump after `"arguments":` used to cost both tool calls and leak the envelope into the answer |
 | **Structural JSON repair** (`readLenient()`): unclosed call objects, `arguments` closed one key early, unescaped quotes, a missing final bracket | 13 replies in one day lost tool calls or showed raw JSON; all 8 distinct shapes now parse into complete calls (§4.6) |
-| **Calls are checked against the tool's own schema** (`inspectCalls()`): an unknown tool or a missing required argument is sent back to the model instead of to the agent | `edit` reached OpenCode without `newString` twice; `view_media` was called 12 times |
+| **Calls are checked against the tool's own schema** (`inspectCalls()`): an unusable call is dropped individually; a reply with no usable call at all is sent back to the model instead of to the agent | `edit` reached OpenCode without `newString` twice; `view_media` was called 12 times; one invented nested name used to discard a valid `run_code` beside it |
 | **`status` decides, not words** (§4.7): `continue` without a tool call is retried; any other answer after a tool result goes to the judge | the word lists missed 13 of 13 real early stops (§4.7) |
-| **Invented tool names are normalised**: `bash`, `cat`, `ls` and friends are mapped onto the available tool via `normalizeToolName()` | the model otherwise calls a tool that does not exist and the turn dies |
+| **Invented tool names are normalised**: `bash`, `cat`, `ls` and friends are mapped onto the available tool via `normalizeToolName()`; matching is case-insensitive (`Read`, `Pwsh`) and `pwsh`/`powershell` map to `shell` | the model otherwise calls a tool that does not exist and the turn dies |
 | **A blank reply never wins**: `preferAnswer()` guards the retry, and `applyFallback()` uses the raw text then an `(empty reply)` marker | an empty assistant message has no parts at all, so the client shows nothing and the session looks frozen |
 
 Additional hardening in `extractEnvelopes()`:
@@ -257,6 +257,50 @@ Fix: a fifth verdict, `missing_result` ("the work is done, but the reply does no
 | needless retries on complete answers (short answers, action-only requests, a real question) | 0/4 | 3/18 |
 
 The 3 needless retries are one case, "compute X and write it to a file" answered with "written to the file": the judge reads "compute" as wanting the figures. A retry there costs one call and returns the figures.
+
+### 4.8 Code Mode: nested tools are not top-level tools
+
+A 2026-11-18 session offered exactly one tool, `run_code` (OpenCode Code Mode).
+The model answered with `tool_calls` for `pwsh`, `read`, `Read`, `Pwsh` and
+`shell`; all seven were rejected, two retries repeated the same mistake, and the
+87 s turn ended with `Proxy rejected invalid tool calls ...`. Those names were
+real tools — but only reachable as `tools.pwsh` / `tools.read` *inside* the
+runner's code.
+
+Two proxy bugs made that trap:
+
+* The system prompt said every tool "ARE called directly by name in `tool_calls`
+  (not inside `execute`)". That wording was measured when direct tools were
+  offered, but it contradicts the Code Mode contract when the runner is the only
+  tool: the model follows the proxy and promotes nested names to top-level calls.
+* `inspectCalls()` marked the whole reply unusable when *any* call failed, so a
+  valid `run_code` call next to one nested name was discarded too, and the retry
+  reminder only repeated `Available tools: run_code` without saying where `pwsh`
+  lived.
+
+Current rules: the prompt is case-aware (`run_code` → "call it and use the other
+tools inside its code"; only direct tools get the "called directly" line), tool
+names match case-insensitively, `pwsh`/`powershell` map to `shell`, each unusable
+call is dropped on its own, and only a reply with no executable call is retried
+with a reminder that explains nested tools. If retries still exhaust, the turn
+shows the rejection diagnostic rather than `(empty reply)`.
+
+A second failure shape appeared in the same session:
+`run_code: missing required argument "code"`, followed by two retries that both
+ended in Venice's native tool loop, so the turn died with the diagnostic again.
+Two rules cover it:
+
+* A payload the model wrote as a bare string (`"arguments": "<script>"`) arrives
+  as `{ content: "<script>" }` because `buildCall()` cannot know the schema.
+  `repairBarePayload()` moves it to the tool's single required argument
+  (`code`, `command`, `path`, ...) when `content` is not one of the schema's
+  properties, so the call the model meant to make is dispatched instead of a
+  retry.
+* When a retry ends in the native loop, the next reminder includes
+  `NATIVE_CALL_REMINDER` alongside the invalid-call text: repeating "these tool
+  names exist" after a native-loop cut never helped, because that reply failed
+  for a different reason. The invalid-call reminder also states that required
+  arguments must use the exact names from the tool schema.
 
 ### Things that do **not** help (measured)
 

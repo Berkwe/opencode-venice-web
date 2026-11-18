@@ -28,7 +28,7 @@ import { repairJsonControlChars } from './sanitize.mjs'
  * not enough, by a second model (the judge), so it works the same in every
  * language.
  */
-export const TOOL_PROMPT = `You are connected to an external agent that executes tools on the user's computer. These tools ARE called directly by name in \`tool_calls\` (not inside \`execute\`); they are NOT Venice server tools.
+export const TOOL_PROMPT = `You are connected to an external agent that executes tools on the user's computer; they are NOT Venice server tools.
 Return ONLY one valid JSON object, without markdown fences and without any text outside JSON, with this exact shape:
 {"content":"text for the user, or an empty string","status":"continue","tool_calls":[{"name":"exact tool name","arguments":{}}]}
 "status" is required and is one of:
@@ -39,6 +39,14 @@ To request a tool, put its name and arguments in tool_calls and STOP; the agent 
 "arguments" is always a JSON object: write file content into it as a properly escaped string (escape line breaks as \\n, escape quotes as \\"). Close every object: each tool call is {"name":...,"arguments":{...}}.
 Do not ask the user for permission to do what they already asked for, and do not end a turn by describing what you are about to do: do it now with tool_calls and "status":"continue".
 For a script longer than one line, write it to a file first and run the file; do not pass multi-line code to a shell command.`
+
+/**
+ * Code Mode runners (OpenCode's `execute`/`run_code`). Their description says
+ * the real tools can only be reached inside the code, usually as
+ * `tools.<name>`. Calling those nested names as top-level tools is the most
+ * common cause of `there is no tool named "..."` retries.
+ */
+const CODE_MODE_TOOLS = new Set(['execute', 'run_code'])
 
 /** Appended as the last user message; see docs/PROTOCOL.md ("format reminder"). */
 export const REMINDER_FIRST_TURN =
@@ -119,8 +127,10 @@ export function serverLoopMessage() {
 }
 
 /** Builds the reminder for tool calls the agent cannot execute. */
-export const invalidCallReminder = (problems, available) =>
-  `your last tool call(s) cannot be executed: ${problems.join('; ')}. Send the reply again with complete, valid tool calls. Available tools: ${available.join(', ')}.`
+export const invalidCallReminder = (problems, available) => {
+  const runner = available.some((name) => CODE_MODE_TOOLS.has(name))
+  return `your last tool call(s) cannot be executed: ${problems.join('; ')}. Send the reply again with complete, valid tool calls. Only these exact top-level tool names exist: ${available.join(', ')}. Every required argument must be present under the exact name its tool schema uses.${runner ? ' A code runner among them reaches the other tools inside its code; those nested names are not top-level tool_calls.' : ''}`
+}
 
 /** Every value the envelope's `status` may take. */
 export const STATUSES = new Set(['continue', 'done', 'ask'])
@@ -153,13 +163,9 @@ export const EMPTY_MARKER = '(empty reply)'
  */
 export function shouldRetry({ message, lastRole, available = [] }) {
   if (message.serverLoop) return { retry: true, reason: 'venice tool loop', reminder: NATIVE_CALL_REMINDER }
-  if (isEmptyAnswer(message) && !message.brokenEnvelope) {
-    return { retry: true, reason: 'empty reply', reminder: EMPTY_RETRY_REMINDER }
-  }
-  if (message.brokenEnvelope && !message.tool_calls) {
-    return { retry: true, reason: 'unreadable envelope', reminder: BROKEN_ENVELOPE_REMINDER }
-  }
-  if (!message.sawEnvelope) return { retry: true, reason: 'plain prose reply', reminder: RETRY_REMINDER }
+  // Checked before the empty-reply rule: dropping an unusable call can leave a
+  // reply with no calls and no content, and the model needs to hear which tool
+  // names are valid rather than "your reply was empty".
   if (message.problems?.length) {
     return {
       retry: true,
@@ -167,6 +173,13 @@ export function shouldRetry({ message, lastRole, available = [] }) {
       reminder: invalidCallReminder(message.problems, available),
     }
   }
+  if (isEmptyAnswer(message) && !message.brokenEnvelope) {
+    return { retry: true, reason: 'empty reply', reminder: EMPTY_RETRY_REMINDER }
+  }
+  if (message.brokenEnvelope && !message.tool_calls) {
+    return { retry: true, reason: 'unreadable envelope', reminder: BROKEN_ENVELOPE_REMINDER }
+  }
+  if (!message.sawEnvelope) return { retry: true, reason: 'plain prose reply', reminder: RETRY_REMINDER }
   if (message.tool_calls) return { retry: false }
   if (message.status === 'continue') {
     return { retry: true, reason: 'status continue without a tool call', reminder: CONTINUE_REMINDER }
@@ -195,7 +208,10 @@ export function applyFallback(message, rawText) {
 
 /** Never dispatch calls already rejected by schema validation. */
 export function rejectInvalidCalls(message) {
-  if (!message.tool_calls || !message.problems?.length) return message
+  // `inspectCalls()` drops unusable calls; when nothing executable is left it
+  // sets `problems` and leaves `tool_calls` empty. Explain that instead of
+  // letting `applyFallback()` replace the turn with "(empty reply)".
+  if (!message.problems?.length) return message
   message.content = `Proxy rejected invalid tool calls; no calls from this reply were dispatched: ${message.problems.join('; ')}`
   message.tool_calls = null
   message.status = 'done'
@@ -322,6 +338,8 @@ const TOOL_ALIASES = {
   bash: 'shell',
   sh: 'shell',
   zsh: 'shell',
+  pwsh: 'shell',
+  powershell: 'shell',
   terminal: 'shell',
   run: 'shell',
   run_command: 'shell',
@@ -340,20 +358,28 @@ const TOOL_ALIASES = {
   list_files: 'glob',
 }
 
-/** Resolves an invented tool name to an available one, or returns it unchanged. */
+/**
+ * Resolves an invented tool name to an available one, or returns it unchanged.
+ * Names are matched case-insensitively: models write `Read` and `Pwsh`, while
+ * the agent's tool ids are lower case.
+ */
 export function normalizeToolName(name, available) {
-  if (available?.has(name)) return name
-  const target = TOOL_ALIASES[name]
-  return target && available?.has(target) ? target : name
+  if (!name || !available?.size) return name
+  if (available.has(name)) return name
+  const folded = name.toLowerCase()
+  for (const candidate of available) if (candidate.toLowerCase() === folded) return candidate
+  const target = TOOL_ALIASES[folded]
+  return target && available.has(target) ? target : name
 }
 
 /**
- * Code Mode wrappers. OpenCode advertises `execute`/`search` alongside real
- * tools and their description ("cannot be called directly") confuses models
- * that are being asked to call tools by name, so they are hidden when other
- * tools exist.
+ * Code Mode wrappers. OpenCode advertises `execute`/`run_code`/`search`
+ * alongside real tools and their description ("cannot be called directly")
+ * confuses models that are being asked to call tools by name, so they are
+ * hidden when other tools exist. When they are the only tools (Code Mode
+ * sessions), they stay and the prompt explains how to use them.
  */
-const WRAPPER_TOOLS = new Set(['execute', 'search'])
+const WRAPPER_TOOLS = new Set([...CODE_MODE_TOOLS, 'search'])
 
 /** Image types taken from a data URL. The proxy fetches nothing, so remote URLs stay text. */
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
@@ -526,8 +552,15 @@ export function toVeniceRequest(body) {
   if (typeof choice === 'object') choice = choice.function?.name ?? 'auto'
 
   if (tools.length) {
+    const runners = tools.map((tool) => tool.function.name).filter((name) => CODE_MODE_TOOLS.has(name))
+    // The Code Mode descriptions say the nested tools cannot be called
+    // directly. The old prompt always said the opposite, so models put nested
+    // names such as `pwsh`/`read` into tool_calls and every call was rejected.
+    const calling = runners.length
+      ? `${runners.map((name) => `"${name}"`).join(', ')} ${runners.length === 1 ? 'runs' : 'run'} code. Call it by name and use the other tools inside its code (its description lists them, usually as \`tools.<name>\`). Nested tool names are NOT valid top-level tool_calls.`
+      : 'These tools ARE called directly by name in tool_calls; they are not nested inside another tool.'
     instructions.push(
-      `${TOOL_PROMPT}\nTool choice: ${JSON.stringify(choice)}.\nAvailable tools:\n${JSON.stringify(tools.map((tool) => tool.function))}`,
+      `${TOOL_PROMPT}\n${calling}\nTool choice: ${JSON.stringify(choice)}.\nAvailable tools:\n${JSON.stringify(tools.map((tool) => tool.function))}`,
     )
     const last = messages[messages.length - 1]
     const lastText = last?.content?.find((part) => part.type === 'output_text')?.text
@@ -1035,19 +1068,50 @@ export function parseToolReply(text) {
 }
 
 /**
- * Maps invented tool names onto available ones and lists what makes a call
- * impossible to execute: an unknown tool, arguments that are not an object, or
- * a missing required argument (from the tool's own JSON schema, as OpenCode
- * sent it). Sets `message.problems`; returns the renames for logging.
+ * A model sometimes writes the payload of a tool as a bare string instead of a
+ * JSON object (for example the whole JavaScript body of `run_code`).
+ * `buildCall()` cannot know the schema, so it arrives as `{ content: "..." }`.
+ * When the tool declares exactly one required argument and `content` is not one
+ * of its properties, the bare payload belongs in that argument (`code`,
+ * `command`, `path`, ...). This is the difference between a lost turn and the
+ * call the model meant to make.
+ */
+function repairBarePayload(args, schema) {
+  const required = Array.isArray(schema?.required) ? schema.required : []
+  if (required.length !== 1 || required[0] in args) return args
+  if (!isPlainObject(schema?.properties) || 'content' in schema.properties) return args
+  if (typeof args.content !== 'string') return args
+  // `content` is not an argument of this tool, so an envelope entry such as
+  // {"name":"run_code","arguments":"<script>"} arrives here as the payload
+  // wrapped in the wrong key. Keep the other keys (`description` is harmless)
+  // and drop `content`, which no schema declares.
+  const { content, ...rest } = args
+  return { ...rest, [required[0]]: content }
+}
+
+/**
+ * Maps invented tool names onto available ones and checks every call against
+ * the tool's own JSON schema, as OpenCode sent it.
  *
- * @param {{ tool_calls: object[]|null, problems?: string[] }} message
+ * A call that cannot be executed is dropped individually. One invented nested
+ * name (for example `pwsh` next to a valid `run_code`) must not throw away the
+ * valid work in the same reply. Only a reply with no usable call at all gets
+ * `message.problems`, which makes `shouldRetry()` ask the model again.
+ *
+ * Sets `message.problems`, `message.dropped` and `message.repaired`; returns the
+ * renames for logging.
+ *
+ * @param {{ tool_calls: object[]|null, problems?: string[], dropped?: string[], repaired?: string[] }} message
  * @param {Map<string, object>} schemas tool name -> JSON schema of its parameters
  */
 export function inspectCalls(message, schemas) {
   message.problems = []
+  message.dropped = []
+  message.repaired = []
   const renames = []
   if (!message.tool_calls || !schemas?.size) return renames
   const available = new Set(schemas.keys())
+  const executable = []
   for (const call of message.tool_calls) {
     const original = call.function.name
     const name = normalizeToolName(original, available)
@@ -1055,24 +1119,39 @@ export function inspectCalls(message, schemas) {
       call.function.name = name
       renames.push(`${original} -> ${name}`)
     }
+    let problem = null
     if (!available.has(name)) {
-      message.problems.push(`there is no tool named "${name}"`)
+      problem = `there is no tool named "${name}"`
+    } else {
+      let args
+      try {
+        args = JSON.parse(call.function.arguments)
+      } catch {
+        args = undefined
+      }
+      if (!isPlainObject(args)) {
+        problem = `${name}: "arguments" must be a JSON object`
+      } else {
+        const schema = schemas.get(name)
+        const repaired = repairBarePayload(args, schema)
+        if (repaired !== args) {
+          args = repaired
+          call.function.arguments = JSON.stringify(args)
+          message.repaired.push(`${name}: bare payload -> ${schema.required[0]}`)
+        }
+        const required = Array.isArray(schema?.required) ? schema.required : []
+        const missing = required.filter((key) => !(key in args))
+        if (missing.length) problem = `${name}: missing required argument ${missing.map((key) => `"${key}"`).join(', ')}`
+      }
+    }
+    if (problem) {
+      message.dropped.push(problem)
       continue
     }
-    let args
-    try {
-      args = JSON.parse(call.function.arguments)
-    } catch {
-      args = undefined
-    }
-    if (!isPlainObject(args)) {
-      message.problems.push(`${name}: "arguments" must be a JSON object`)
-      continue
-    }
-    const required = Array.isArray(schemas.get(name)?.required) ? schemas.get(name).required : []
-    const missing = required.filter((key) => !(key in args))
-    if (missing.length) message.problems.push(`${name}: missing required argument ${missing.map((key) => `"${key}"`).join(', ')}`)
+    executable.push(call)
   }
+  message.tool_calls = executable.length ? executable : null
+  if (!executable.length) message.problems = message.dropped
   return renames
 }
 

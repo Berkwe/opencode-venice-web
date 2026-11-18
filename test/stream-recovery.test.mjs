@@ -26,6 +26,20 @@ const body = {
   messages: [{ role: 'user', content: 'Read a.txt' }],
   tools: [{ type: 'function', function: { name: 'read', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } }],
 }
+// OpenCode Code Mode: the real tools live inside `run_code`, not at top level.
+const codeBody = {
+  model: DEFAULT_MODEL,
+  messages: [{ role: 'user', content: 'Inspect the binary' }],
+  tools: [{
+    type: 'function',
+    function: {
+      name: 'run_code',
+      description: 'Run JavaScript. Other tools are nested: tools.pwsh, tools.read.',
+      parameters: { type: 'object', properties: { code: { type: 'string' } }, required: ['code'] },
+    },
+  }],
+}
+const envelope = (toolCalls, content = '') => JSON.stringify({ content, status: 'continue', tool_calls: toolCalls })
 const drain = async (generator) => {
   const chunks = []
   for await (const chunk of generator) chunks.push(chunk)
@@ -84,6 +98,111 @@ test('a valid envelope after native external rounds is accepted without a retry'
     chat: async () => { throw new Error('unexpected retry') },
   }))
   assert.equal(calls(chunks).length, 1)
+})
+
+test('a valid run_code call is dispatched even when a nested tool name rides along', async () => {
+  const reply = envelope([
+    { name: 'run_code', arguments: { code: 'return await tools.pwsh({ command: "dir" })' } },
+    { name: 'pwsh', arguments: { command: 'dir' } },
+  ])
+  let attempts = 0
+  const chunks = await drain(openaiChunks(codeBody, toVeniceRequest(codeBody), stream(text(reply)), undefined, trace, {
+    chat: async () => { attempts++; throw new Error('unexpected retry') },
+  }))
+  // the invalid nested name is dropped, the executable call still reaches the agent
+  assert.equal(attempts, 0)
+  assert.deepEqual(calls(chunks).map((call) => call.function.name), ['run_code'])
+})
+
+test('a nested tool name on a Code Mode turn is retried with the runner explanation', async () => {
+  const bad = envelope([{ name: 'pwsh', arguments: { command: 'dir' } }])
+  const good = envelope([{ name: 'run_code', arguments: { code: 'return 1' } }])
+  let attempts = 0
+  const chunks = await drain(openaiChunks(codeBody, toVeniceRequest(codeBody), stream(text(bad)), undefined, trace, {
+    chat: async (request) => {
+      attempts++
+      assert.match(request.messages.at(-1).content[0].text, /code runner/)
+      return response(text(good))
+    },
+  }))
+  assert.equal(attempts, 1)
+  assert.deepEqual(calls(chunks).map((call) => call.function.name), ['run_code'])
+})
+
+test('an all-invalid Code Mode reply explains the rejection instead of "(empty reply)"', async () => {
+  const bad = envelope([
+    { name: 'pwsh', arguments: { command: 'dir' } },
+    { name: 'read', arguments: { path: 'a' } },
+  ])
+  let attempts = 0
+  const chunks = await drain(openaiChunks(codeBody, toVeniceRequest(codeBody), stream(text(bad)), undefined, trace, {
+    chat: async () => { attempts++; return response(text(bad)) },
+  }))
+  assert.equal(attempts, 2)
+  const content = chunks.map((chunk) => chunk.choices[0].delta.content ?? '').join('')
+  assert.match(content, /no calls from this reply were dispatched/)
+  assert.match(content, /pwsh/)
+  assert.doesNotMatch(content, /\(empty reply\)/)
+})
+
+test('a reply that omits the required `code` is recovered by the retry', async () => {
+  const bad = envelope([{ name: 'run_code', arguments: { description: 'Probe MCP session' } }])
+  const good = envelope([{ name: 'run_code', arguments: { code: 'return 1' } }])
+  let attempts = 0
+  const chunks = await drain(openaiChunks(codeBody, toVeniceRequest(codeBody), stream(text(bad)), undefined, trace, {
+    chat: async (request) => {
+      attempts++
+      assert.match(request.messages.at(-1).content[0].text, /missing required argument "code"/)
+      assert.match(request.messages.at(-1).content[0].text, /exact name its tool schema uses/)
+      return response(text(good))
+    },
+  }))
+  assert.equal(attempts, 1)
+  assert.deepEqual(calls(chunks).map((call) => call.function.name), ['run_code'])
+})
+
+test('a bare-string run_code payload is executed without spending a retry', async () => {
+  const reply = '{"content":"","status":"continue","tool_calls":[{"name":"run_code","arguments":"return 1"}]}'
+  let attempts = 0
+  const chunks = await drain(openaiChunks(codeBody, toVeniceRequest(codeBody), stream(text(reply)), undefined, trace, {
+    chat: async () => { attempts++; throw new Error('unexpected retry') },
+  }))
+  assert.equal(attempts, 0)
+  assert.deepEqual(calls(chunks).map((call) => JSON.parse(call.function.arguments)), [{ code: 'return 1' }])
+})
+
+test('a retry that itself hits the native loop is retried with the native-call reminder', async () => {
+  // the kept reply has real content, so the loop message does not replace it and
+  // the next reminder has to carry both facts
+  const bad = JSON.stringify({
+    content: 'Probing MCP session.',
+    status: 'continue',
+    tool_calls: [{ name: 'run_code', arguments: { description: 'Probe MCP session' } }],
+  })
+  const good = envelope([{ name: 'run_code', arguments: { code: 'return 1' } }])
+  // two stuck steps of the same native call: collectStream cuts the loop
+  const loop = [0, 1].flatMap((n) => [
+    { type: 'response.output_item.added', output_index: n, item: { type: 'veniceai:tool_call_generation', id: `tcg_agent-node:llm:${n}` } },
+    { type: 'veniceai:tool_call_generation.in_progress', item_id: `tcg_agent-node:llm:${n}`, detected_tools: [{ type: 'Unrecognized', name: 'run_code' }] },
+    { type: 'response.output_item.done', output_index: n, item: { type: 'veniceai:tool_call_generation', id: `tcg_agent-node:llm:${n}`, status: 'completed' } },
+  ])
+  let attempts = 0
+  const chunks = await drain(openaiChunks(codeBody, toVeniceRequest(codeBody), stream(text(bad)), undefined, trace, {
+    chat: async (request) => {
+      attempts++
+      const reminder = request.messages.at(-1).content[0].text
+      if (attempts === 1) {
+        assert.match(reminder, /missing required argument "code"/)
+        return response(loop)
+      }
+      // the third attempt must explain the native loop, not repeat attempt 1
+      assert.match(reminder, /Venice internal native-tool routing/)
+      assert.match(reminder, /missing required argument "code"/)
+      return response(text(good))
+    },
+  }))
+  assert.equal(attempts, 2)
+  assert.deepEqual(calls(chunks).map((call) => call.function.name), ['run_code'])
 })
 
 test('an incomplete correction never replaces a completed answer or dispatches partial calls', async () => {

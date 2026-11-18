@@ -204,6 +204,12 @@ test('retry exhaustion never emits known invalid tool calls', () => {
   assert.equal(message.tool_calls, null)
   assert.equal(message.status, 'done')
   assert.match(message.content, /unknown tool/)
+  // inspectCalls leaves no call at all when every name was rejected; the turn
+  // must still explain that instead of showing "(empty reply)"
+  const dropped = { content: '', tool_calls: null, problems: ['there is no tool named "pwsh"'] }
+  rejectInvalidCalls(dropped)
+  assert.match(dropped.content, /pwsh/)
+  assert.equal(dropped.status, 'done')
   const valid = { tool_calls: [call], problems: [] }
   assert.equal(rejectInvalidCalls(valid).tool_calls.length, 1)
 })

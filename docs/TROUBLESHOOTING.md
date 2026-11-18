@@ -185,6 +185,33 @@ retries when a call names an unknown tool or misses a required argument
 slips through, capture it with `VENICE_WEB_DEBUG=1` and add it to
 `test/fixtures/real-replies.mjs`.
 
+## `there is no tool named "pwsh" / "read" / "shell"` in a Code Mode session
+
+This is a tool-name mismatch, not a Venice failure. A Code Mode session offers a
+single runner (`run_code`, or `execute` in older OpenCode builds); the shell/read
+tools exist only *inside* it as `tools.pwsh`, `tools.read`, and so on. The proxy's
+prompt used to say every tool is called directly "not inside `execute`", so models
+put those nested names into `tool_calls`. The proxy then rejected the whole reply,
+retried twice with the same wording (about 40 s per retry), and finally showed
+`Proxy rejected invalid tool calls ...`.
+
+Current behaviour: the prompt distinguishes direct tools from a code runner, name
+matching is case-insensitive, `pwsh`/`powershell` map to `shell` when that tool is
+offered, and an unusable call is dropped without discarding a valid `run_code`
+call beside it. If the log still shows the message, the model is ignoring the
+available-tools list: copy the request with `VENICE_WEB_DUMP=req.json`, check
+`mapping.request.systemPrompt.instructions`, and open an issue with the model ID.
+
+### `run_code: missing required argument "code"`
+
+The model wrote the script as a bare string (`"arguments": "<script>"`), which
+`buildCall()` can only wrap as `{ content: "<script>" }`, or it filled only
+`description`. The proxy moves a bare payload into the tool's single required
+argument when `content` is not a declared property, so the call runs without a
+retry. If the reply genuinely omits `code`, the retry reminder names the missing
+argument and, when that retry itself falls into Venice's native loop, the next
+reminder explains the native loop too instead of repeating the same request.
+
 ## `400 String must not contain null bytes`
 
 A NUL byte (`\x00`) reached the request. It usually comes from reading a binary file: `grep -a`, `cat` or `tail` on a `.db`, `.pyc`, binary or app bundle puts NUL bytes into a tool result, they land in the stored session, and every later request of that session carries them.

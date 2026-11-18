@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Code Mode tool names.** A session whose only tool is `run_code` no longer
+  loses the whole turn when the model promotes nested names (`pwsh`, `read`,
+  `shell`) to top-level tool calls. The prompt now explains that nested tools run
+  inside the runner, names match case-insensitively (`Read`, `Pwsh`, and `pwsh`
+  → `shell`), and an unusable call is dropped individually so a valid `run_code`
+  beside it is still dispatched. A payload written as a bare string is moved into
+  the tool's single required argument (`run_code` → `code`) instead of costing a
+  retry, and a retry that itself ends in Venice's native loop now gets the
+  native-loop reminder rather than a repeat of the invalid-call wording.
+  Exhausted retries show the rejection diagnostic instead of `(empty reply)`.
+
 - **Selected phone-checkout fixes merged.** Thinking turns can finish their JSON
   envelope after native rounds, with finite loop limits retained. Interrupted
   tool replies are retried instead of dispatching partial calls; failed native

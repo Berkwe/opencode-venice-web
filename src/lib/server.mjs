@@ -18,6 +18,7 @@ import {
   countTokens,
   inspectCalls,
   judgeDecision,
+  NATIVE_CALL_REMINDER,
   parseJudgeVerdict,
   parseToolReply,
   preferAnswer,
@@ -325,6 +326,8 @@ export async function* openaiChunks(body, mapping, upstreamBody, signal, trace =
       if (!collected.terminal) return { ...serverLoopMessage(), incomplete: true }
       const parsed = parseToolReply(text)
       for (const rename of inspectCalls(parsed, mapping.toolSchemas)) log(`  ~ tool name ${rename}`)
+      for (const repaired of parsed.repaired ?? []) log(`  ~ repaired tool call: ${repaired}`)
+      for (const dropped of parsed.dropped ?? []) log(`  ~ dropped tool call: ${dropped}`)
       // Failed native external calls are not evidence of client tool execution.
       // Legitimate Venice built-ins (e.g. view_media) must not taint an answer.
       if (collected.nativeExternalTools.size && !parsed.tool_calls?.length) {
@@ -337,6 +340,10 @@ export async function* openaiChunks(body, mapping, upstreamBody, signal, trace =
     let judged = 0
     let formatRetries = 0
     let recoveryRequest = mapping.request
+    // Set when a retry fell into Venice's native tool loop. The reply it
+    // replaced is retried again, so the next reminder has to explain the native
+    // loop instead of repeating the reason of the first reply.
+    let nativeLoopRetry = false
 
     // Up to two extra attempts while the reply is unhelpful. Every trigger is
     // structural (see shouldRetry); a reply that ends the turn right after a tool
@@ -347,6 +354,16 @@ export async function* openaiChunks(body, mapping, upstreamBody, signal, trace =
     for (;;) {
       signal?.throwIfAborted()
       let decision = shouldRetry({ message, lastRole: last?.role, available })
+      if (nativeLoopRetry && decision.retry && !decision.reason.startsWith('judge:')) {
+        // Both facts matter: the external tools exist, and the reply that was
+        // kept still needs valid argument names.
+        decision = {
+          ...decision,
+          reason: `${decision.reason} after a native loop`,
+          reminder: `${NATIVE_CALL_REMINDER} ${decision.reminder}`,
+        }
+      }
+      nativeLoopRetry = false
       if (decision.judge) {
         if (!judgeEnabled || judged >= 2) break
         judged++
@@ -379,6 +396,7 @@ export async function* openaiChunks(body, mapping, upstreamBody, signal, trace =
         } else {
           log('  ~ retry did not improve the reply, keeping the first')
           if (decision.reason.startsWith('judge:')) break
+          if (retryMessage.serverLoop && !retryMessage.incomplete) nativeLoopRetry = true
         }
       } catch (error) {
         warn('  ~ retry failed:', error.message)

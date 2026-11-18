@@ -23,6 +23,7 @@ import {
   judgeDecision,
   lastToolResult,
   normalizeToolName,
+  invalidCallReminder,
   parseJudgeVerdict,
   parseNativeCalls,
   parseToolReply,
@@ -129,6 +130,32 @@ test('toVeniceRequest: keeps wrappers when they are the only tools', () => {
     tools: [tool('execute')],
   })
   assert.deepEqual([...mapping.toolNames], ['execute'])
+})
+
+test('toVeniceRequest: a Code Mode runner is described as a runner, not as a nested tool', () => {
+  const mapping = toVeniceRequest({
+    model: Object.keys(MODELS)[0],
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [tool('run_code')],
+  })
+  const prompt = mapping.request.systemPrompt.instructions
+  assert.match(prompt, /"run_code" runs code/)
+  assert.match(prompt, /use the other tools inside its code/)
+  assert.match(prompt, /Nested tool names are NOT valid top-level tool_calls/)
+  // the old blanket "not inside execute" wording is what caused models to call
+  // pwsh/read/shell as top-level tools and lose the whole turn
+  assert.doesNotMatch(prompt, /not inside `execute`/)
+})
+
+test('toVeniceRequest: direct tools keep the direct-call instruction', () => {
+  const mapping = toVeniceRequest({
+    model: Object.keys(MODELS)[0],
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [tool('read')],
+  })
+  const prompt = mapping.request.systemPrompt.instructions
+  assert.match(prompt, /ARE called directly by name/)
+  assert.doesNotMatch(prompt, /runs code/)
 })
 
 test('toVeniceRequest: appends the format reminder as the last user message', () => {
@@ -365,6 +392,8 @@ const SCHEMAS = new Map([
   ['shell', { type: 'object', required: ['command'] }],
   ['read', { type: 'object', required: ['path'] }],
   ['glob', { type: 'object', required: ['pattern'] }],
+  ['run_code', { type: 'object', required: ['code'], properties: { code: { type: 'string' }, description: { type: 'string' } } }],
+  ['write', { type: 'object', required: ['path'], properties: { path: { type: 'string' }, content: { type: 'string' } } }],
 ])
 const argsOf = (call) => JSON.parse(call.function.arguments)
 const checked = (text) => {
@@ -487,18 +516,81 @@ test('stripToolMarkup keeps prose and drops markup', () => {
 
 // ------------------------------------------------- executable tool calls
 
-test('inspectCalls maps aliases and reports what the agent cannot execute', () => {
+test('inspectCalls maps aliases, keeps valid calls and drops only unusable ones', () => {
   const message = parseToolReply(
     '{"content":"","tool_calls":[{"name":"bash","arguments":{"command":"ls"}},{"name":"view_media","arguments":{"media_ids":["a.png"]}},{"name":"edit","arguments":{"path":"a","oldString":"x"}}]}',
   )
   const renames = inspectCalls(message, SCHEMAS)
   assert.deepEqual(renames, ['bash -> shell'])
+  assert.equal(message.tool_calls.length, 1)
   assert.equal(message.tool_calls[0].function.name, 'shell')
+  assert.deepEqual(message.problems, [])
+  assert.deepEqual(message.dropped, ['there is no tool named "view_media"', 'edit: missing required argument "newString"'])
+  // one executable call is enough to run it instead of throwing the turn away
+  assert.deepEqual(shouldRetry({ message, lastRole: 'tool', available: ['shell', 'edit'] }), { retry: false })
+})
+
+test('inspectCalls rejects the reply only when no call can be executed', () => {
+  const message = parseToolReply(
+    '{"content":"","tool_calls":[{"name":"view_media","arguments":{"media_ids":["a.png"]}},{"name":"edit","arguments":{"path":"a","oldString":"x"}}]}',
+  )
+  assert.deepEqual(inspectCalls(message, SCHEMAS), [])
+  assert.equal(message.tool_calls, null)
   assert.deepEqual(message.problems, ['there is no tool named "view_media"', 'edit: missing required argument "newString"'])
   const decision = shouldRetry({ message, lastRole: 'tool', available: ['shell', 'edit'] })
   assert.equal(decision.retry, true)
-  assert.match(decision.reminder, /view_media/)
-  assert.match(decision.reminder, /Available tools: shell, edit/)
+  assert.match(decision.reminder, /Only these exact top-level tool names exist: shell, edit/)
+})
+
+test('inspectCalls repairs a bare-string payload into the single required argument', () => {
+  const message = parseToolReply(
+    '{"content":"","tool_calls":[{"name":"run_code","arguments":"const r = await tools.pwsh({ command: \'dir\' })\\nreturn r"}]}',
+  )
+  assert.deepEqual(inspectCalls(message, SCHEMAS), [])
+  assert.equal(message.tool_calls.length, 1)
+  assert.deepEqual(argsOf(message.tool_calls[0]), { code: "const r = await tools.pwsh({ command: 'dir' })\nreturn r" })
+  assert.deepEqual(message.repaired, ['run_code: bare payload -> code'])
+  assert.deepEqual(message.problems, [])
+})
+
+test('inspectCalls repairs a wrapped payload even when a stray key rides along', () => {
+  const message = parseToolReply(
+    '{"content":"","tool_calls":[{"name":"run_code","arguments":{"description":"Check MCP","content":"return 1"}}]}',
+  )
+  inspectCalls(message, SCHEMAS)
+  assert.deepEqual(argsOf(message.tool_calls[0]), { description: 'Check MCP', code: 'return 1' })
+  assert.deepEqual(message.repaired, ['run_code: bare payload -> code'])
+})
+
+test('inspectCalls does not move a declared `content` argument', () => {
+  const message = parseToolReply('{"content":"","tool_calls":[{"name":"write","arguments":{"content":"file body"}}]}')
+  inspectCalls(message, SCHEMAS)
+  // `content` is a real property of `write`, so the payload stays and `path` is reported
+  assert.equal(message.tool_calls, null)
+  assert.deepEqual(message.repaired, [])
+  assert.deepEqual(message.problems, ['write: missing required argument "path"'])
+})
+
+test('the invalid-call reminder names the required argument rules', () => {
+  const reminder = invalidCallReminder(['run_code: missing required argument "code"'], ['run_code'])
+  assert.match(reminder, /missing required argument "code"/)
+  assert.match(reminder, /exact name its tool schema uses/)
+})
+
+test('inspectCalls matches names case-insensitively and maps pwsh to shell', () => {
+  const message = parseToolReply(
+    '{"content":"","tool_calls":[{"name":"Read","arguments":{"path":"a"}},{"name":"PWSH","arguments":{"command":"dir"}}]}',
+  )
+  assert.deepEqual(inspectCalls(message, SCHEMAS), ['Read -> read', 'PWSH -> shell'])
+  assert.deepEqual(message.tool_calls.map((call) => call.function.name), ['read', 'shell'])
+  assert.deepEqual(message.problems, [])
+})
+
+test('the invalid-call reminder explains how a Code Mode runner exposes nested tools', () => {
+  const reminder = invalidCallReminder(['there is no tool named "pwsh"'], ['run_code'])
+  assert.match(reminder, /code runner/)
+  assert.match(reminder, /nested names are not top-level tool_calls/)
+  assert.doesNotMatch(invalidCallReminder(['there is no tool named "x"'], ['read']), /code runner/)
 })
 
 test('inspectCalls without schemas checks nothing', () => {
